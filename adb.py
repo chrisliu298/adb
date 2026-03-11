@@ -433,7 +433,7 @@ def print_stats(
     def _section(content, title, **kwargs):
         tc = SECTION_COLORS.get(title, "bold")
         return Panel(
-            content, title=f"[{tc}] {title} [/{tc}]", title_align="left",
+            content, title=f"[{tc}]{title}[/{tc}]", title_align="left",
             border_style=BORDER, box=box.ROUNDED, padding=(0, 1), width=width, **kwargs,
         )
 
@@ -561,7 +561,7 @@ def print_stats(
     console.print()
     console.print(Panel(
         Group(*header_parts),
-        title=f"[{header_tc}] adb [/{header_tc}]", title_align="left",
+        title=f"[{header_tc}]adb[/{header_tc}]", title_align="left",
         border_style=BORDER, box=box.ROUNDED, padding=(0, 1), width=width,
     ))
 
@@ -636,7 +636,7 @@ def print_stats(
     _cost_tc = SECTION_COLORS.get("Cost", "bold")
     cost_panel = Panel(
         Group(cost_bar_table, Text(""), cost_summary),
-        title=f"[{_cost_tc}] Cost [/{_cost_tc}]", title_align="left",
+        title=f"[{_cost_tc}]Cost[/{_cost_tc}]", title_align="left",
         border_style=BORDER, box=box.ROUNDED, padding=(0, 1),
     )
 
@@ -734,7 +734,7 @@ def print_stats(
 
     _act_tc = SECTION_COLORS.get("Activity", "bold")
     activity_panel = Panel(
-        act, title=f"[{_act_tc}] Activity [/{_act_tc}]", title_align="left",
+        act, title=f"[{_act_tc}]Activity[/{_act_tc}]", title_align="left",
         border_style=BORDER, box=box.ROUNDED, padding=(0, 1),
     )
 
