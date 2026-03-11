@@ -545,20 +545,21 @@ def parse(*, sessions_dir: Path = SESSIONS_DIR) -> ToolStats | None:
                 longest_dur_ms = dur
                 longest_msgs = s.user_messages + s.assistant_messages
 
-    # Rate limits — prefer the most recently started session that has data,
-    # not the latest event timestamp (long-running sessions report stale limits)
+    # Rate limits — use the most recent rate_limits_at timestamp across all
+    # sessions, which gives us the freshest observation regardless of when
+    # the session started
     best_rl: dict | None = None
-    best_rl_session_start: datetime | None = None
+    best_rl_at: datetime | None = None
     for s in agg.sessions:
-        if not s.rate_limits or not s.started_at:
+        if not s.rate_limits or not s.rate_limits_at:
             continue
         # Skip model-specific rate limits (e.g. codex_bengalfox for Spark);
         # only use the main "codex" bucket
         lid = s.rate_limits.get("limit_id", "")
         if lid and lid != "codex":
             continue
-        if best_rl_session_start is None or s.started_at > best_rl_session_start:
-            best_rl_session_start = s.started_at
+        if best_rl_at is None or s.rate_limits_at > best_rl_at:
+            best_rl_at = s.rate_limits_at
             best_rl = s.rate_limits
     rate_limits = _convert_rate_limits(best_rl)
 
