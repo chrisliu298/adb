@@ -1,0 +1,5 @@
+# Remote hosts to sync usage data from (one per line).
+# These should be SSH-accessible hostnames or aliases from ~/.ssh/config.
+# Copy this file to remotes.conf and add your hosts.
+# server1
+# server2
