@@ -443,6 +443,174 @@ def _load_projects_from_sessions(projects_base: Path) -> list[ProjectInfo]:
 PROJECTS_BASE = Path.home() / ".claude" / "projects"
 
 
+def _discover_project_dirs(projects_base: Path) -> list[Path]:
+    """Discover all Claude Code project directories.
+
+    For local (default projects_base), also checks CLAUDE_CONFIG_DIR,
+    XDG_CONFIG_HOME, and ~/.claude-* dirs.
+    For remote (custom projects_base), just returns [projects_base].
+    """
+    if projects_base != PROJECTS_BASE:
+        return [projects_base] if projects_base.is_dir() else []
+
+    home = Path.home()
+    dirs: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(d: Path) -> None:
+        resolved = str(d.resolve())
+        if resolved not in seen and d.is_dir():
+            seen.add(resolved)
+            dirs.append(d)
+
+    env_dirs = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if env_dirs:
+        for p in env_dirs.split(","):
+            p = p.strip()
+            if p:
+                _add(Path(p).resolve() / "projects")
+
+    _add(projects_base)
+
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip() or str(home / ".config")
+    _add(Path(xdg) / "claude" / "projects")
+
+    try:
+        for entry in home.iterdir():
+            if entry.is_dir() and entry.name.startswith(".claude-"):
+                _add(entry / "projects")
+    except OSError:
+        pass
+
+    return dirs
+
+
+def _parse_file_tokens_loose(
+    jsonl_file: Path,
+) -> list[tuple[str, str, int, int, int, int]]:
+    """Parse a single JSONL file with loose filtering for tokens.
+
+    Accepts any entry with timestamp + message.usage (no role/stop_reason check).
+    Deduplicates within the file by messageId:requestId composite key.
+    Returns list of (hash_or_empty, model, inp, out, cr, cw) per unique entry.
+    """
+    entries: list[tuple[str, str, int, int, int, int]] = []
+    seen: set[str] = set()
+
+    try:
+        with jsonl_file.open("rb") as f:
+            for line in f:
+                if b'"usage"' not in line:
+                    continue
+                try:
+                    obj = orjson.loads(line)
+                except (orjson.JSONDecodeError, ValueError):
+                    continue
+
+                if not obj.get("timestamp"):
+                    continue
+                msg = obj.get("message")
+                if not msg or not msg.get("usage"):
+                    continue
+
+                mid = msg.get("id", "")
+                rid = obj.get("requestId", "")
+                h = ""
+                if mid and rid:
+                    h = f"{mid}:{rid}"
+                    if h in seen:
+                        continue
+                    seen.add(h)
+
+                u = msg["usage"]
+                inp = u.get("input_tokens", 0)
+                out = u.get("output_tokens", 0)
+                cr = u.get("cache_read_input_tokens", 0)
+                cw = u.get("cache_creation_input_tokens", 0)
+
+                if inp + out + cr + cw == 0:
+                    continue
+
+                model = msg.get("model", "") or "unknown"
+                if model == "<synthetic>":
+                    model = "unknown"
+
+                entries.append((h, model, inp, out, cr, cw))
+    except OSError:
+        pass
+
+    return entries
+
+
+def _load_all_tokens(
+    projects_dirs: list[Path],
+) -> tuple[TokenBreakdown, dict[str, TokenBreakdown]]:
+    """Load token totals from all JSONL files across project dirs.
+
+    Uses loose filtering (any entry with timestamp + message.usage) and
+    messageId:requestId composite dedup. Per-file entry lists are cached.
+    """
+    import hashlib
+
+    dirs_str = ":".join(sorted(str(d) for d in projects_dirs))
+    dirs_hash = hashlib.md5(dirs_str.encode()).hexdigest()[:12]
+    cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
+    cache_path = cache_dir / f"claude-tokens-{dirs_hash}.json"
+    cache = _load_cache(cache_path)
+    cache_dirty = False
+
+    seen_hashes: set[str] = set()
+    total_tokens = TokenBreakdown()
+    models: dict[str, TokenBreakdown] = {}
+
+    for projects_base in projects_dirs:
+        if not projects_base.exists():
+            continue
+        for proj_dir in projects_base.iterdir():
+            if not proj_dir.is_dir() or proj_dir.name.startswith("."):
+                continue
+            for jsonl_file in proj_dir.rglob("*.jsonl"):
+                fpath = str(jsonl_file)
+                try:
+                    st = jsonl_file.stat()
+                    fkey = f"{st.st_size}:{st.st_mtime_ns}"
+                except OSError:
+                    continue
+
+                cached_entry = cache.get(fpath)
+                if cached_entry and cached_entry.get("k") == fkey:
+                    file_entries = cached_entry.get("e", [])
+                else:
+                    raw_entries = _parse_file_tokens_loose(jsonl_file)
+                    file_entries = [list(e) for e in raw_entries]
+                    cache[fpath] = {"k": fkey, "e": file_entries}
+                    cache_dirty = True
+
+                # Exact global dedup per entry
+                for entry in file_entries:
+                    h, model = entry[0], entry[1]
+                    inp, out, cr, cw = entry[2], entry[3], entry[4], entry[5]
+                    if h:
+                        if h in seen_hashes:
+                            continue
+                        seen_hashes.add(h)
+                    tb = TokenBreakdown(
+                        input_tokens=inp,
+                        output_tokens=out,
+                        cache_read_tokens=cr,
+                        cache_write_tokens=cw,
+                    )
+                    total_tokens.add(tb)
+                    if model not in models:
+                        models[model] = TokenBreakdown()
+                    models[model].add(tb)
+
+    if cache_dirty:
+        _save_cache(cache_path, cache)
+
+    return total_tokens, models
+
+
 def parse(
     *,
     stats_path: Path = STATS,
@@ -492,41 +660,57 @@ def parse(
     total_messages = st.get("totalMessages", 0)
     total_tool_calls = sum(d.get("toolCallCount", 0) for d in da)
 
-    # Model breakdown and costs from modelUsage (all-time)
-    total_tokens = TokenBreakdown()
+    # Token breakdown: merge JSONL session files + stats-cache, taking max per model
+    projects_dirs = _discover_project_dirs(projects_base)
+    jsonl_tokens, jsonl_models = _load_all_tokens(projects_dirs)
+
+    # Build stats-cache per-model breakdowns
+    sc_models: dict[str, TokenBreakdown] = {}
+    for m, u in mu.items():
+        sc_models[m] = TokenBreakdown(
+            input_tokens=u.get("inputTokens", 0),
+            output_tokens=u.get("outputTokens", 0),
+            cache_read_tokens=u.get("cacheReadInputTokens", 0),
+            cache_write_tokens=u.get("cacheCreationInputTokens", 0),
+        )
+
+    # Merge: for each model, pick whichever source has a higher total
     models: dict[str, TokenBreakdown] = {}
+    all_model_names = set(jsonl_models.keys()) | set(sc_models.keys())
+    for m in all_model_names:
+        jtb = jsonl_models.get(m)
+        stb = sc_models.get(m)
+        if jtb and stb:
+            models[m] = jtb if jtb.total >= stb.total else stb
+        elif jtb:
+            models[m] = jtb
+        else:
+            models[m] = stb  # type: ignore[assignment]
+
+    total_tokens = TokenBreakdown()
     model_costs: dict[str, float] = {}
     cb = CostBreakdown()
-
-    for m, u in mu.items():
-        inp = u.get("inputTokens", 0)
-        out = u.get("outputTokens", 0)
-        cr = u.get("cacheReadInputTokens", 0)
-        cw = u.get("cacheCreationInputTokens", 0)
-
-        tb = TokenBreakdown(
-            input_tokens=inp,
-            output_tokens=out,
-            cache_read_tokens=cr,
-            cache_write_tokens=cw,
-        )
-        models[m] = tb
+    for m, tb in models.items():
         total_tokens.add(tb)
-
         pk = _pkey(m)
-        c = _model_cost(u, pk)
-        model_costs[m] = c
-
+        c = 0.0
         if pk and pk in PRICE:
             p = PRICE[pk]
-            cb.input_tokens += inp
-            cb.output_tokens += out
-            cb.cache_read_tokens += cr
-            cb.cache_write_tokens += cw
-            cb.input_cost += inp * p[0] / 1e6
-            cb.output_cost += out * p[1] / 1e6
-            cb.cache_read_cost += cr * (p[0] * CACHE_READ_MULTIPLIER) / 1e6
-            cb.cache_write_cost += cw * (p[0] * CACHE_WRITE_MULTIPLIER) / 1e6
+            c = (
+                tb.input_tokens * p[0]
+                + tb.output_tokens * p[1]
+                + tb.cache_read_tokens * (p[0] * CACHE_READ_MULTIPLIER)
+                + tb.cache_write_tokens * (p[0] * CACHE_WRITE_MULTIPLIER)
+            ) / 1e6
+            cb.input_tokens += tb.input_tokens
+            cb.output_tokens += tb.output_tokens
+            cb.cache_read_tokens += tb.cache_read_tokens
+            cb.cache_write_tokens += tb.cache_write_tokens
+            cb.input_cost += tb.input_tokens * p[0] / 1e6
+            cb.output_cost += tb.output_tokens * p[1] / 1e6
+            cb.cache_read_cost += tb.cache_read_tokens * (p[0] * CACHE_READ_MULTIPLIER) / 1e6
+            cb.cache_write_cost += tb.cache_write_tokens * (p[0] * CACHE_WRITE_MULTIPLIER) / 1e6
+        model_costs[m] = c
 
     total_cost = sum(model_costs.values())
 
