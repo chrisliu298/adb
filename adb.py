@@ -660,24 +660,50 @@ def print_stats(
         models_table.add_column("Output", justify="right", no_wrap=True, min_width=6)
         models_table.add_column("Cache", justify="right", no_wrap=True, min_width=6)
         models_table.add_column("Cost", justify="right", no_wrap=True, min_width=10)
+        models_table.add_column("In $/M", justify="right", no_wrap=True, min_width=7)
+        models_table.add_column("Out $/M", justify="right", no_wrap=True, min_width=7)
         models_table.add_column("%", justify="right", style="dim", no_wrap=True, min_width=5)
+
+        def _model_prices(name: str) -> tuple[float | None, float | None]:
+            pk = claude_parser._pkey(name)
+            if pk and pk in claude_parser.PRICE:
+                p = claude_parser.PRICE[pk]
+                return p[0], p[1]
+            cp = codex_parser._pricing_for(name)
+            if cp:
+                return cp.input_usd_per_mtok, cp.output_usd_per_mtok
+            return None, None
+
+        w_in_num = w_in_den = w_out_num = w_out_den = 0.0
         for rank, (m, (tb, cost)) in enumerate(sorted(
             merged_models.items(), key=lambda x: x[1][1], reverse=True
         )):
             cache = tb.cache_read_tokens + tb.cache_write_tokens
             pct = fmt_pct(cost, total_cost)
             row_style = "dim" if rank >= 3 else None
-            models_table.add_row(m, fmt_tokens(tb.total), fmt_tokens(tb.input_tokens), fmt_tokens(tb.output_tokens), fmt_tokens(cache), Text.from_markup(fmt_cost_styled(cost)), pct, style=row_style)
+            in_p, out_p = _model_prices(m)
+            in_str = f"${in_p:.2f}" if in_p is not None else "\u2014"
+            out_str = f"${out_p:.2f}" if out_p is not None else "\u2014"
+            if in_p is not None:
+                in_toks = tb.input_tokens + tb.cache_read_tokens + tb.cache_write_tokens
+                w_in_num += in_p * in_toks
+                w_in_den += in_toks
+            if out_p is not None:
+                w_out_num += out_p * tb.output_tokens
+                w_out_den += tb.output_tokens
+            models_table.add_row(m, fmt_tokens(tb.total), fmt_tokens(tb.input_tokens), fmt_tokens(tb.output_tokens), fmt_tokens(cache), Text.from_markup(fmt_cost_styled(cost)), in_str, out_str, pct, style=row_style)
         t_total = sum(tb.total for tb, _ in merged_models.values())
         t_in = sum(tb.input_tokens for tb, _ in merged_models.values())
         t_out = sum(tb.output_tokens for tb, _ in merged_models.values())
         t_cache = sum(tb.cache_read_tokens + tb.cache_write_tokens for tb, _ in merged_models.values())
         t_cost_sum = sum(c for _, c in merged_models.values())
         models_table.add_section()
-        models_table.add_row("[bold]Total[/bold]", fmt_tokens(t_total), fmt_tokens(t_in), fmt_tokens(t_out), fmt_tokens(t_cache), Text.from_markup(fmt_cost_styled(t_cost_sum)), "", style="bold")
+        w_in_avg = f"${w_in_num / w_in_den:.2f}" if w_in_den else "\u2014"
+        w_out_avg = f"${w_out_num / w_out_den:.2f}" if w_out_den else "\u2014"
+        models_table.add_row("[bold]Total[/bold]", fmt_tokens(t_total), fmt_tokens(t_in), fmt_tokens(t_out), fmt_tokens(t_cache), Text.from_markup(fmt_cost_styled(t_cost_sum)), w_in_avg, w_out_avg, "", style="bold")
         if combined.unpriced_models:
             names = ", ".join(sorted(combined.unpriced_models))
-            models_table.add_row(Text(f"Unpriced: {names} ({fmt_tokens(combined.unpriced_tokens)})", style="yellow"), "", "", "", "", "", "")
+            models_table.add_row(Text(f"Unpriced: {names} ({fmt_tokens(combined.unpriced_tokens)})", style="yellow"), "", "", "", "", "", "", "", "")
         console.print(_section(models_table, "Models"))
 
     # --- 3. ACTIVITY ---
