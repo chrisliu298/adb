@@ -175,10 +175,15 @@ def load_all(machines: list[str] | None = None) -> tuple[ToolStats | None, ToolS
         ck = None
         claude_stats = base / "claude" / "stats-cache.json"
         if claude_stats.exists():
+            # Prefer recall-sync staging dir (.remote-<host>) over adb cache —
+            # it's a superset (never deletes) and avoids double-counting since
+            # _iter_project_dirs skips .remote-* dirs in the local parse.
+            staging = Path.home() / ".claude" / "projects" / f".remote-{host}"
+            projects = staging if staging.is_dir() else base / "claude" / "projects"
             ck = dict(
                 stats_path=claude_stats,
                 history_path=base / "claude" / "history.jsonl",
-                projects_base=base / "claude" / "projects",
+                projects_base=projects,
             )
         xk = None
         codex_sessions = base / "codex" / "sessions"

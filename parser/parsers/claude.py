@@ -443,19 +443,14 @@ PROJECTS_BASE = Path.home() / ".claude" / "projects"
 def _iter_project_dirs(projects_base: Path):
     """Yield (proj_key, proj_dir) for each project directory.
 
-    Handles both regular project dirs and .remote-<host>/ staging dirs
-    created by recall-sync.
+    Skips dot-prefixed directories (including .remote-<host>/ staging dirs).
+    Remote staging dirs are handled by load_all() in adb.py, which passes
+    them as projects_base for the corresponding remote host.
     """
     for entry in projects_base.iterdir():
-        if not entry.is_dir():
+        if not entry.is_dir() or entry.name.startswith("."):
             continue
-        if entry.name.startswith(".remote-"):
-            # Staging dir: .remote-<host>/<project>/<session>.jsonl
-            for sub in entry.iterdir():
-                if sub.is_dir():
-                    yield sub.name, sub
-        elif not entry.name.startswith("."):
-            yield entry.name, entry
+        yield entry.name, entry
 
 
 def _discover_project_dirs(projects_base: Path) -> list[Path]:
