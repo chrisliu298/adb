@@ -356,10 +356,7 @@ def _load_projects_from_sessions(projects_base: Path) -> list[ProjectInfo]:
     project_paths: dict[str, str] = {}
     seen_ids: set[str] = set()
 
-    for proj_dir in projects_base.iterdir():
-        if not proj_dir.is_dir() or proj_dir.name.startswith("."):
-            continue
-        proj_key = proj_dir.name
+    for proj_key, proj_dir in _iter_project_dirs(projects_base):
         for jsonl_file in proj_dir.rglob("*.jsonl"):
             fpath = str(jsonl_file)
             try:
@@ -441,6 +438,24 @@ def _load_projects_from_sessions(projects_base: Path) -> list[ProjectInfo]:
 
 
 PROJECTS_BASE = Path.home() / ".claude" / "projects"
+
+
+def _iter_project_dirs(projects_base: Path):
+    """Yield (proj_key, proj_dir) for each project directory.
+
+    Handles both regular project dirs and .remote-<host>/ staging dirs
+    created by recall-sync.
+    """
+    for entry in projects_base.iterdir():
+        if not entry.is_dir():
+            continue
+        if entry.name.startswith(".remote-"):
+            # Staging dir: .remote-<host>/<project>/<session>.jsonl
+            for sub in entry.iterdir():
+                if sub.is_dir():
+                    yield sub.name, sub
+        elif not entry.name.startswith("."):
+            yield entry.name, entry
 
 
 def _discover_project_dirs(projects_base: Path) -> list[Path]:
@@ -566,9 +581,7 @@ def _load_all_tokens(
     for projects_base in projects_dirs:
         if not projects_base.exists():
             continue
-        for proj_dir in projects_base.iterdir():
-            if not proj_dir.is_dir() or proj_dir.name.startswith("."):
-                continue
+        for _, proj_dir in _iter_project_dirs(projects_base):
             for jsonl_file in proj_dir.rglob("*.jsonl"):
                 fpath = str(jsonl_file)
                 try:

@@ -128,6 +128,23 @@ def _load_machine(
     return name, c, x
 
 
+SYNC_SCRIPT = REPO_DIR / "sync.sh"
+
+
+def _sync_remotes() -> None:
+    """Run sync.sh to pull fresh data from remote machines."""
+    if not SYNC_SCRIPT.exists():
+        return
+    import subprocess
+
+    subprocess.run(
+        [str(SYNC_SCRIPT)],
+        cwd=str(REPO_DIR),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def load_all(machines: list[str] | None = None) -> tuple[ToolStats | None, ToolStats | None, MachineData]:
     """Load and merge stats from local + remote machines.
 
@@ -148,6 +165,10 @@ def load_all(machines: list[str] | None = None) -> tuple[ToolStats | None, ToolS
         include_remotes = []
     else:
         include_remotes = [h for h in machines if h in all_remotes]
+
+    # Sync remotes before reading their data
+    if include_remotes:
+        _sync_remotes()
 
     for host in include_remotes:
         base = REMOTE_CACHE / host
