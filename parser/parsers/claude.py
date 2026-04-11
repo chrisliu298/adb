@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timezone
 from pathlib import Path
 
 import orjson
@@ -619,6 +619,144 @@ def _load_all_tokens(
     return total_tokens, models
 
 
+def _parse_session_daily(
+    jsonl_file: Path,
+) -> dict[str, list[int]]:
+    """Parse one JSONL file for daily activity.
+
+    Returns dict mapping ISO date → [messages, tool_calls, output_tokens].
+    """
+    daily: dict[str, list[int]] = {}
+    seen_msg_ids: set[str] = set()
+
+    try:
+        with jsonl_file.open("rb") as f:
+            for line in f:
+                if b'"timestamp"' not in line:
+                    continue
+                try:
+                    obj = orjson.loads(line)
+                except (orjson.JSONDecodeError, ValueError):
+                    continue
+
+                ts = obj.get("timestamp")
+                if not ts:
+                    continue
+
+                if isinstance(ts, str):
+                    day_str = ts[:10]
+                elif isinstance(ts, (int, float)):
+                    day_str = datetime.fromtimestamp(
+                        ts / 1000, tz=timezone.utc
+                    ).strftime("%Y-%m-%d")
+                else:
+                    continue
+
+                if day_str not in daily:
+                    daily[day_str] = [0, 0, 0]
+
+                msg = obj.get("message")
+                if not msg:
+                    continue
+                role = msg.get("role")
+                if role == "user":
+                    daily[day_str][0] += 1
+                elif role == "assistant" and msg.get("stop_reason") in (
+                    "end_turn",
+                    "tool_use",
+                ):
+                    mid = msg.get("id", "")
+                    if mid:
+                        if mid in seen_msg_ids:
+                            continue
+                        seen_msg_ids.add(mid)
+                    daily[day_str][0] += 1
+                    content = msg.get("content", [])
+                    if isinstance(content, list):
+                        daily[day_str][1] += sum(
+                            1
+                            for c in content
+                            if isinstance(c, dict) and c.get("type") == "tool_use"
+                        )
+                    usage = msg.get("usage")
+                    if usage:
+                        daily[day_str][2] += usage.get("output_tokens", 0)
+    except OSError:
+        pass
+
+    return daily
+
+
+def _build_daily_from_sessions(
+    projects_dirs: list[Path],
+) -> list[DayActivity]:
+    """Build daily activity from session JSONL files with caching."""
+    import hashlib
+
+    dirs_str = ":".join(sorted(str(d) for d in projects_dirs))
+    dirs_hash = hashlib.md5(dirs_str.encode()).hexdigest()[:12]
+    cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
+    cache_path = cache_dir / f"claude-daily-{dirs_hash}.json"
+    cache = _load_cache(cache_path)
+    cache_dirty = False
+
+    agg: dict[str, list[int]] = {}  # date → [msgs, sessions, tools, otoks]
+
+    for projects_base in projects_dirs:
+        if not projects_base.exists():
+            continue
+        for _, proj_dir in _iter_project_dirs(projects_base):
+            for jsonl_file in proj_dir.rglob("*.jsonl"):
+                fpath = str(jsonl_file)
+                try:
+                    st = jsonl_file.stat()
+                    fkey = f"{st.st_size}:{st.st_mtime_ns}"
+                except OSError:
+                    continue
+
+                cached = cache.get(fpath)
+                if cached and cached.get("k") == fkey:
+                    file_days = cached.get("d", {})
+                else:
+                    file_days = _parse_session_daily(jsonl_file)
+                    cache[fpath] = {"k": fkey, "d": file_days}
+                    cache_dirty = True
+
+                for day_str, data in file_days.items():
+                    if day_str not in agg:
+                        agg[day_str] = [0, 0, 0, 0]
+                    agg[day_str][0] += data[0]
+                    agg[day_str][2] += data[1]
+                    agg[day_str][3] += data[2]
+
+                # Count session: 1 per file, attributed to first day
+                if file_days:
+                    first_day = min(file_days.keys())
+                    if first_day not in agg:
+                        agg[first_day] = [0, 0, 0, 0]
+                    agg[first_day][1] += 1
+
+    if cache_dirty:
+        _save_cache(cache_path, cache)
+
+    result = []
+    for d, v in agg.items():
+        try:
+            dt = date.fromisoformat(d)
+        except ValueError:
+            continue
+        result.append(
+            DayActivity(
+                day=dt,
+                messages=v[0],
+                sessions=v[1],
+                tool_calls=v[2],
+                output_tokens=v[3],
+            )
+        )
+    return sorted(result, key=lambda x: x.day)
+
+
 def parse(
     *,
     stats_path: Path = STATS,
@@ -662,14 +800,34 @@ def parse(
         else:
             daily_map[dt] = DayActivity(day=dt, output_tokens=ot)
 
+    # Token breakdown: merge JSONL session files + stats-cache, taking max per model
+    projects_dirs = _discover_project_dirs(projects_base)
+
+    # Supplement daily from session JSONL (covers dates after stats-cache stops)
+    session_daily = _build_daily_from_sessions(projects_dirs)
+    for sd in session_daily:
+        if sd.day in daily_map:
+            d = daily_map[sd.day]
+            d.messages = max(d.messages, sd.messages)
+            d.sessions = max(d.sessions, sd.sessions)
+            d.tool_calls = max(d.tool_calls, sd.tool_calls)
+            d.output_tokens = max(d.output_tokens, sd.output_tokens)
+        else:
+            daily_map[sd.day] = sd
+
     daily = sorted(daily_map.values(), key=lambda x: x.day)
 
     total_sessions = st.get("totalSessions", 0)
     total_messages = st.get("totalMessages", 0)
     total_tool_calls = sum(d.get("toolCallCount", 0) for d in da)
 
-    # Token breakdown: merge JSONL session files + stats-cache, taking max per model
-    projects_dirs = _discover_project_dirs(projects_base)
+    # Update totals from session-derived daily (stats-cache may be stale)
+    session_total_msgs = sum(sd.messages for sd in session_daily)
+    session_total_sess = sum(sd.sessions for sd in session_daily)
+    session_total_tools = sum(sd.tool_calls for sd in session_daily)
+    total_sessions = max(total_sessions, session_total_sess)
+    total_messages = max(total_messages, session_total_msgs)
+    total_tool_calls = max(total_tool_calls, session_total_tools)
     jsonl_tokens, jsonl_models = _load_all_tokens(projects_dirs)
 
     # Build stats-cache per-model breakdowns

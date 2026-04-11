@@ -145,11 +145,12 @@ def _sync_remotes() -> None:
     )
 
 
-def load_all(machines: list[str] | None = None) -> tuple[ToolStats | None, ToolStats | None, MachineData]:
+def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[ToolStats | None, ToolStats | None, MachineData]:
     """Load and merge stats from local + remote machines.
 
     machines: list of machine names to include. None or ["all"] means local + all remotes.
               ["local"] means local only. Otherwise, include local + named remotes.
+    sync: if True, run sync.sh to pull fresh data from remotes before reading.
     """
     # Build work items: (name, claude_kwargs, codex_kwargs)
     work: list[tuple[str, dict | None, dict | None]] = []
@@ -166,8 +167,8 @@ def load_all(machines: list[str] | None = None) -> tuple[ToolStats | None, ToolS
     else:
         include_remotes = [h for h in machines if h in all_remotes]
 
-    # Sync remotes before reading their data
-    if include_remotes:
+    # Sync remotes if explicitly requested
+    if sync and include_remotes:
         _sync_remotes()
 
     for host in include_remotes:
@@ -865,9 +866,13 @@ def main() -> None:
         "machines", nargs="*", default=["all"],
         help="machines to include (default: all). Use 'local' for local only, or list specific remote names.",
     )
+    ap.add_argument(
+        "--sync", action="store_true",
+        help="sync remote machine data (via rsync) before reading",
+    )
     args = ap.parse_args()
 
-    claude, codex, per_machine = load_all(args.machines)
+    claude, codex, per_machine = load_all(args.machines, sync=args.sync)
     stats_list = [s for s in (claude, codex) if s is not None]
     if not stats_list:
         print("No usage data found.")
