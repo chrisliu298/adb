@@ -30,6 +30,7 @@ HISTORY = Path.home() / ".claude" / "history.jsonl"
 CACHE_READ_MULTIPLIER = 0.1
 CACHE_WRITE_MULTIPLIER = float(os.getenv("CLAUDE_CACHE_WRITE_MULTIPLIER", "1.25"))
 PRICE: dict[str, list[float]] = {
+    "opus-4-7": [5, 25],
     "opus-4-6": [5, 25],
     "opus-4-5": [5, 25],
     "sonnet-4-6": [3, 15],
