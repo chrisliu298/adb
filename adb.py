@@ -354,7 +354,6 @@ def print_stats(
     agg_cb = combined.cost_breakdown
     # Aggregate projects by short name for display
     projects_by_name: dict[str, ProjectInfo] = {}
-    project_machines: dict[str, set[str]] = {}
     for p in combined.projects:
         name = short_project_name(p.path)
         if name in projects_by_name:
@@ -365,16 +364,6 @@ def print_stats(
                 output_tokens=p.output_tokens, lines_added=p.lines_added,
                 lines_removed=p.lines_removed, duration_ms=p.duration_ms,
             )
-    # Build project → machine mapping from per_machine data
-    if per_machine:
-        for machine_name, (mc, mx) in per_machine.items():
-            for s in (mc, mx):
-                if s is None:
-                    continue
-                for p in s.projects:
-                    name = short_project_name(p.path)
-                    if name in projects_by_name:
-                        project_machines.setdefault(name, set()).add(machine_name)
 
     # --- 1. RECENT (Today / This Week / This Month) ---
     today = date.today()
@@ -840,18 +829,15 @@ def print_stats(
         sorted_projects = sorted(projects_by_name.values(), key=lambda p: p.cost, reverse=True)[:10]
         proj_table = Table(box=box.SIMPLE_HEAD, show_edge=False, padding=(0, 1), expand=True)
         proj_table.add_column("Project", style="bold", no_wrap=True)
-        proj_table.add_column("Machine", no_wrap=True)
         proj_table.add_column("Cost", justify="right", no_wrap=True)
         proj_table.add_column("Output Tokens", justify="right", no_wrap=True)
         proj_table.add_column("Duration", justify="right", no_wrap=True)
         proj_table.add_column("$/Hour", justify="right", no_wrap=True)
         for p in sorted_projects:
             name = p.path[:30]
-            machines = sorted(project_machines.get(p.path, set()))
-            machine_str = ", ".join(machines) if machines else "—"
             dur = fmt_duration(p.duration_ms) if p.duration_ms > 0 else "—"
             cph = fmt_cost_styled(p.cost / (p.duration_ms / 3_600_000)) if p.duration_ms > 0 else "—"
-            proj_table.add_row(name, machine_str, Text.from_markup(fmt_cost_styled(p.cost)), fmt_tokens(p.output_tokens), dur, Text.from_markup(cph) if p.duration_ms > 0 else cph)
+            proj_table.add_row(name, Text.from_markup(fmt_cost_styled(p.cost)), fmt_tokens(p.output_tokens), dur, Text.from_markup(cph) if p.duration_ms > 0 else cph)
         console.print(_section(proj_table, "Projects (Top 10)"))
 
 
