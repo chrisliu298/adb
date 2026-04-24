@@ -28,7 +28,11 @@ STATS = Path.home() / ".claude" / "stats-cache.json"
 HISTORY = Path.home() / ".claude" / "history.jsonl"
 
 CACHE_READ_MULTIPLIER = 0.1
-CACHE_WRITE_MULTIPLIER = float(os.getenv("CLAUDE_CACHE_WRITE_MULTIPLIER", "1.25"))
+# Claude prompt-cache write pricing: 5-min TTL is 1.25x input, 1-hour TTL is 2x input.
+# Claude Code currently uses 1-hour caching exclusively; parsers read the per-message
+# cache_creation.ephemeral_{5m,1h}_input_tokens breakdown and price each bucket correctly.
+CACHE_WRITE_5M_MULTIPLIER = 1.25
+CACHE_WRITE_1H_MULTIPLIER = 2.0
 PRICE: dict[str, list[float]] = {
     "opus-4-7": [5, 25],
     "opus-4-6": [5, 25],
@@ -49,17 +53,22 @@ def _pkey(model: str) -> str | None:
     return None
 
 
-def _model_cost(u: dict, pk: str | None) -> float:
-    if not pk or pk not in PRICE:
-        return 0.0
-    p = PRICE[pk]
-    cr = p[0] * CACHE_READ_MULTIPLIER
-    cw = p[0] * CACHE_WRITE_MULTIPLIER
+def _cw_split(u: dict) -> tuple[int, int]:
+    """Return (cache_write_total, cache_write_1h) from a JSONL usage dict."""
+    cw_total = u.get("cache_creation_input_tokens", 0) or 0
+    cc = u.get("cache_creation")
+    cw_1h = 0
+    if isinstance(cc, dict):
+        cw_1h = cc.get("ephemeral_1h_input_tokens", 0) or 0
+    return cw_total, cw_1h
+
+
+def _cw_cost(cw_total: int, cw_1h: int, input_price: float) -> float:
+    """Cost for cache-write tokens, priced per TTL bucket."""
+    cw_5m = max(0, cw_total - cw_1h)
     return (
-        u.get("inputTokens", 0) * p[0]
-        + u.get("outputTokens", 0) * p[1]
-        + u.get("cacheReadInputTokens", 0) * cr
-        + u.get("cacheCreationInputTokens", 0) * cw
+        cw_5m * input_price * CACHE_WRITE_5M_MULTIPLIER
+        + cw_1h * input_price * CACHE_WRITE_1H_MULTIPLIER
     ) / 1e6
 
 
@@ -271,13 +280,12 @@ def _parse_one_session_file(
                             inp = u.get("input_tokens", 0)
                             out = u.get("output_tokens", 0)
                             cr = u.get("cache_read_input_tokens", 0)
-                            cw = u.get("cache_creation_input_tokens", 0)
+                            cw_total, cw_1h = _cw_split(u)
                             cost += (
                                 inp * p[0]
                                 + out * p[1]
                                 + cr * p[0] * CACHE_READ_MULTIPLIER
-                                + cw * p[0] * CACHE_WRITE_MULTIPLIER
-                            ) / 1e6
+                            ) / 1e6 + _cw_cost(cw_total, cw_1h, p[0])
                             output_tokens += out
                     except (orjson.JSONDecodeError, ValueError, TypeError):
                         continue
@@ -343,10 +351,11 @@ def _load_projects_from_sessions(projects_base: Path) -> list[ProjectInfo]:
         return []
 
     # Store cache in repo's .cache dir, not inside ~/.claude/projects/
+    # v2: costs recomputed with TTL-aware cache-write pricing (5m 1.25x / 1h 2x).
     import hashlib
     base_hash = hashlib.md5(str(projects_base).encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    cache_path = cache_dir / f"claude-projects-{base_hash}.json"
+    cache_path = cache_dir / f"claude-projects2-{base_hash}.json"
     cache = _load_cache(cache_path)
     cache_dirty = False
 
@@ -498,14 +507,14 @@ def _discover_project_dirs(projects_base: Path) -> list[Path]:
 
 def _parse_file_tokens_loose(
     jsonl_file: Path,
-) -> list[tuple[str, str, int, int, int, int]]:
+) -> list[tuple[str, str, int, int, int, int, int]]:
     """Parse a single JSONL file with loose filtering for tokens.
 
     Accepts any entry with timestamp + message.usage (no role/stop_reason check).
     Deduplicates within the file by messageId:requestId composite key.
-    Returns list of (hash_or_empty, model, inp, out, cr, cw) per unique entry.
+    Returns list of (hash_or_empty, model, inp, out, cr, cw_total, cw_1h) per unique entry.
     """
-    entries: list[tuple[str, str, int, int, int, int]] = []
+    entries: list[tuple[str, str, int, int, int, int, int]] = []
     seen: set[str] = set()
 
     try:
@@ -537,16 +546,16 @@ def _parse_file_tokens_loose(
                 inp = u.get("input_tokens", 0)
                 out = u.get("output_tokens", 0)
                 cr = u.get("cache_read_input_tokens", 0)
-                cw = u.get("cache_creation_input_tokens", 0)
+                cw_total, cw_1h = _cw_split(u)
 
-                if inp + out + cr + cw == 0:
+                if inp + out + cr + cw_total == 0:
                     continue
 
                 model = msg.get("model", "") or "unknown"
                 if model == "<synthetic>":
                     model = "unknown"
 
-                entries.append((h, model, inp, out, cr, cw))
+                entries.append((h, model, inp, out, cr, cw_total, cw_1h))
     except OSError:
         pass
 
@@ -566,7 +575,8 @@ def _load_all_tokens(
     dirs_str = ":".join(sorted(str(d) for d in projects_dirs))
     dirs_hash = hashlib.md5(dirs_str.encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    cache_path = cache_dir / f"claude-tokens-{dirs_hash}.json"
+    # v2: entries are 7-tuples including cache_write_1h (TTL split)
+    cache_path = cache_dir / f"claude-tokens2-{dirs_hash}.json"
     cache = _load_cache(cache_path)
     cache_dirty = False
 
@@ -599,6 +609,7 @@ def _load_all_tokens(
                 for entry in file_entries:
                     h, model = entry[0], entry[1]
                     inp, out, cr, cw = entry[2], entry[3], entry[4], entry[5]
+                    cw_1h = entry[6] if len(entry) > 6 else 0
                     if h:
                         if h in seen_hashes:
                             continue
@@ -608,6 +619,7 @@ def _load_all_tokens(
                         output_tokens=out,
                         cache_read_tokens=cr,
                         cache_write_tokens=cw,
+                        cache_write_1h_tokens=cw_1h,
                     )
                     total_tokens.add(tb)
                     if model not in models:
@@ -620,16 +632,17 @@ def _load_all_tokens(
     return total_tokens, models
 
 
-def _parse_session_daily(
+def _parse_session_events(
     jsonl_file: Path,
-) -> dict[str, list[int]]:
-    """Parse one JSONL file for daily activity.
+) -> list[tuple[str, str, str, int, int]]:
+    """Parse one JSONL file into per-message events for daily aggregation.
 
-    Returns dict mapping ISO date → [messages, tool_calls, output_tokens].
+    Returns a list of tuples: (day_str, role, mid, tool_count, output_tokens).
+    - role is "u" for user turns, "a" for completed assistant turns.
+    - Assistant mids let the aggregator dedup messages that appear in multiple
+      session files (e.g. subagent replay), which otherwise inflates daily counts.
     """
-    daily: dict[str, list[int]] = {}
-    seen_msg_ids: set[str] = set()
-
+    events: list[tuple[str, str, str, int, int]] = []
     try:
         with jsonl_file.open("rb") as f:
             for line in f:
@@ -653,55 +666,56 @@ def _parse_session_daily(
                 else:
                     continue
 
-                if day_str not in daily:
-                    daily[day_str] = [0, 0, 0]
-
                 msg = obj.get("message")
                 if not msg:
                     continue
                 role = msg.get("role")
                 if role == "user":
-                    daily[day_str][0] += 1
+                    events.append((day_str, "u", "", 0, 0))
                 elif role == "assistant" and msg.get("stop_reason") in (
                     "end_turn",
                     "tool_use",
                 ):
-                    mid = msg.get("id", "")
-                    if mid:
-                        if mid in seen_msg_ids:
-                            continue
-                        seen_msg_ids.add(mid)
-                    daily[day_str][0] += 1
+                    mid = msg.get("id", "") or ""
                     content = msg.get("content", [])
+                    tool_count = 0
                     if isinstance(content, list):
-                        daily[day_str][1] += sum(
+                        tool_count = sum(
                             1
                             for c in content
                             if isinstance(c, dict) and c.get("type") == "tool_use"
                         )
-                    usage = msg.get("usage")
-                    if usage:
-                        daily[day_str][2] += usage.get("output_tokens", 0)
+                    usage = msg.get("usage") or {}
+                    otoks = usage.get("output_tokens", 0) or 0
+                    events.append((day_str, "a", mid, tool_count, otoks))
     except OSError:
         pass
 
-    return daily
+    return events
 
 
 def _build_daily_from_sessions(
     projects_dirs: list[Path],
 ) -> list[DayActivity]:
-    """Build daily activity from session JSONL files with caching."""
+    """Build daily activity from session JSONL files with caching and global dedup.
+
+    Assistant messages are deduped by msg.id across files to avoid inflating
+    daily output_tokens/messages/tool_calls when subagent sessions replay
+    messages from a parent session.
+    """
     import hashlib
 
     dirs_str = ":".join(sorted(str(d) for d in projects_dirs))
     dirs_hash = hashlib.md5(dirs_str.encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    cache_path = cache_dir / f"claude-daily-{dirs_hash}.json"
+    # v2: caches per-message events (not per-file daily aggregates) so dedup
+    # can happen globally at aggregation time.
+    cache_path = cache_dir / f"claude-daily2-{dirs_hash}.json"
     cache = _load_cache(cache_path)
     cache_dirty = False
 
     agg: dict[str, list[int]] = {}  # date → [msgs, sessions, tools, otoks]
+    seen_asst_ids: set[str] = set()
 
     for projects_base in projects_dirs:
         if not projects_base.exists():
@@ -717,22 +731,33 @@ def _build_daily_from_sessions(
 
                 cached = cache.get(fpath)
                 if cached and cached.get("k") == fkey:
-                    file_days = cached.get("d", {})
+                    file_events = cached.get("e", [])
                 else:
-                    file_days = _parse_session_daily(jsonl_file)
-                    cache[fpath] = {"k": fkey, "d": file_days}
+                    file_events = [list(e) for e in _parse_session_events(jsonl_file)]
+                    cache[fpath] = {"k": fkey, "e": file_events}
                     cache_dirty = True
 
-                for day_str, data in file_days.items():
+                file_days: set[str] = set()
+                for ev in file_events:
+                    day_str, role, mid = ev[0], ev[1], ev[2]
+                    tool_count, otoks = ev[3], ev[4]
+                    file_days.add(day_str)
                     if day_str not in agg:
                         agg[day_str] = [0, 0, 0, 0]
-                    agg[day_str][0] += data[0]
-                    agg[day_str][2] += data[1]
-                    agg[day_str][3] += data[2]
+                    if role == "u":
+                        agg[day_str][0] += 1
+                    elif role == "a":
+                        if mid:
+                            if mid in seen_asst_ids:
+                                continue
+                            seen_asst_ids.add(mid)
+                        agg[day_str][0] += 1
+                        agg[day_str][2] += tool_count
+                        agg[day_str][3] += otoks
 
                 # Count session: 1 per file, attributed to first day
                 if file_days:
-                    first_day = min(file_days.keys())
+                    first_day = min(file_days)
                     if first_day not in agg:
                         agg[first_day] = [0, 0, 0, 0]
                     agg[first_day][1] += 1
@@ -790,31 +815,41 @@ def parse(
             tool_calls=d.get("toolCallCount", 0),
         )
 
-    # Add output tokens from dailyModelTokens
+    # Seed daily output_tokens from stats-cache.json as a fallback for days whose
+    # session JSONL has since been pruned. Session-derived values (computed below)
+    # win wherever they exist, because stats-cache's dailyModelTokens is not
+    # globally deduped across files and overcounts on days with subagent replay.
+    sc_daily_output: dict[date, int] = {}
     for d in dm:
         dt = _parse_date(d.get("date", ""))
         if dt is None:
             continue
-        ot = sum(d.get("tokensByModel", {}).values())
-        if dt in daily_map:
-            daily_map[dt].output_tokens = ot
-        else:
-            daily_map[dt] = DayActivity(day=dt, output_tokens=ot)
+        sc_daily_output[dt] = sum(d.get("tokensByModel", {}).values())
 
     # Token breakdown: merge JSONL session files + stats-cache, taking max per model
     projects_dirs = _discover_project_dirs(projects_base)
 
-    # Supplement daily from session JSONL (covers dates after stats-cache stops)
+    # Session-derived daily — the authoritative source when available.
     session_daily = _build_daily_from_sessions(projects_dirs)
+    session_days = {sd.day for sd in session_daily}
     for sd in session_daily:
         if sd.day in daily_map:
             d = daily_map[sd.day]
             d.messages = max(d.messages, sd.messages)
             d.sessions = max(d.sessions, sd.sessions)
             d.tool_calls = max(d.tool_calls, sd.tool_calls)
-            d.output_tokens = max(d.output_tokens, sd.output_tokens)
+            d.output_tokens = sd.output_tokens
         else:
             daily_map[sd.day] = sd
+
+    # For days with no session data, fall back to the stats-cache figure.
+    for dt, ot in sc_daily_output.items():
+        if dt in session_days:
+            continue
+        if dt in daily_map:
+            daily_map[dt].output_tokens = ot
+        else:
+            daily_map[dt] = DayActivity(day=dt, output_tokens=ot)
 
     daily = sorted(daily_map.values(), key=lambda x: x.day)
 
@@ -831,14 +866,18 @@ def parse(
     total_tool_calls = max(total_tool_calls, session_total_tools)
     jsonl_tokens, jsonl_models = _load_all_tokens(projects_dirs)
 
-    # Build stats-cache per-model breakdowns
+    # Build stats-cache per-model breakdowns.
+    # stats-cache.json doesn't expose the 5m/1h TTL split; Claude Code uses 1h
+    # exclusively today, so we treat all cache-write tokens from this source as 1h.
     sc_models: dict[str, TokenBreakdown] = {}
     for m, u in mu.items():
+        cw = u.get("cacheCreationInputTokens", 0)
         sc_models[m] = TokenBreakdown(
             input_tokens=u.get("inputTokens", 0),
             output_tokens=u.get("outputTokens", 0),
             cache_read_tokens=u.get("cacheReadInputTokens", 0),
-            cache_write_tokens=u.get("cacheCreationInputTokens", 0),
+            cache_write_tokens=cw,
+            cache_write_1h_tokens=cw,
         )
 
     # Merge: for each model, pick whichever source has a higher total
@@ -863,12 +902,12 @@ def parse(
         c = 0.0
         if pk and pk in PRICE:
             p = PRICE[pk]
+            cw_cost = _cw_cost(tb.cache_write_tokens, tb.cache_write_1h_tokens, p[0])
             c = (
                 tb.input_tokens * p[0]
                 + tb.output_tokens * p[1]
                 + tb.cache_read_tokens * (p[0] * CACHE_READ_MULTIPLIER)
-                + tb.cache_write_tokens * (p[0] * CACHE_WRITE_MULTIPLIER)
-            ) / 1e6
+            ) / 1e6 + cw_cost
             cb.input_tokens += tb.input_tokens
             cb.output_tokens += tb.output_tokens
             cb.cache_read_tokens += tb.cache_read_tokens
@@ -876,7 +915,7 @@ def parse(
             cb.input_cost += tb.input_tokens * p[0] / 1e6
             cb.output_cost += tb.output_tokens * p[1] / 1e6
             cb.cache_read_cost += tb.cache_read_tokens * (p[0] * CACHE_READ_MULTIPLIER) / 1e6
-            cb.cache_write_cost += tb.cache_write_tokens * (p[0] * CACHE_WRITE_MULTIPLIER) / 1e6
+            cb.cache_write_cost += cw_cost
         model_costs[m] = c
 
     total_cost = sum(model_costs.values())

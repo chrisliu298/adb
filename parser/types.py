@@ -12,7 +12,8 @@ class TokenBreakdown:
 
     input_tokens is always non-cached input.
     cache_read_tokens is cached input (Claude: cacheReadInputTokens, Codex: cached_input_tokens).
-    cache_write_tokens is Claude-only (cacheCreationInputTokens).
+    cache_write_tokens is Claude-only (cacheCreationInputTokens), total across TTLs.
+    cache_write_1h_tokens is the 1-hour-TTL subset of cache_write_tokens (remainder = 5-minute).
     reasoning_tokens is Codex-only (reasoning_output_tokens).
     """
 
@@ -20,6 +21,7 @@ class TokenBreakdown:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    cache_write_1h_tokens: int = 0
     reasoning_tokens: int = 0
 
     @property
@@ -37,6 +39,7 @@ class TokenBreakdown:
         self.output_tokens += other.output_tokens
         self.cache_read_tokens += other.cache_read_tokens
         self.cache_write_tokens += other.cache_write_tokens
+        self.cache_write_1h_tokens += other.cache_write_1h_tokens
         self.reasoning_tokens += other.reasoning_tokens
 
 
@@ -164,6 +167,7 @@ class ToolStats:
                 "output": self.total_tokens.output_tokens,
                 "cache_read": self.total_tokens.cache_read_tokens,
                 "cache_write": self.total_tokens.cache_write_tokens,
+                "cache_write_1h": self.total_tokens.cache_write_1h_tokens,
                 "reasoning": self.total_tokens.reasoning_tokens,
                 "total": self.total_tokens.total,
             },
@@ -179,6 +183,7 @@ class ToolStats:
                     "output": tb.output_tokens,
                     "cache_read": tb.cache_read_tokens,
                     "cache_write": tb.cache_write_tokens,
+                    "cache_write_1h": tb.cache_write_1h_tokens,
                     "reasoning": tb.reasoning_tokens,
                     "total": tb.total,
                     "cost": round(self.model_costs.get(m, 0), 2),
@@ -242,6 +247,7 @@ class ToolStats:
                 output_tokens=md.get("output", 0),
                 cache_read_tokens=md.get("cache_read", 0),
                 cache_write_tokens=md.get("cache_write", 0),
+                cache_write_1h_tokens=md.get("cache_write_1h", 0),
                 reasoning_tokens=md.get("reasoning", 0),
             )
             model_costs[m] = md.get("cost", 0.0)
@@ -254,6 +260,7 @@ class ToolStats:
                 output_tokens=tt.get("output", 0),
                 cache_read_tokens=tt.get("cache_read", 0),
                 cache_write_tokens=tt.get("cache_write", 0),
+                cache_write_1h_tokens=tt.get("cache_write_1h", 0),
                 reasoning_tokens=tt.get("reasoning", 0),
             ),
             total_sessions=data.get("total_sessions", 0),
