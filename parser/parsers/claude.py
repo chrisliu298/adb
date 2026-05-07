@@ -234,94 +234,107 @@ def _parse_date(s: str) -> date | None:
             return None
 
 
+_TERMINAL_STOP_REASONS = frozenset(
+    ("end_turn", "tool_use", "stop_sequence", "max_tokens", "pause_turn", "refusal")
+)
+_IDLE_GAP_S = 30 * 60  # 30 minutes — anything longer is treated as user idle
+
+
 def _parse_one_session_file(
     jsonl_file: Path,
 ) -> tuple[str | None, float, int, set[str], int]:
-    """Parse a single JSONL file, return (cwd, cost, output_tokens, seen_ids, duration_ms)."""
+    """Parse a single JSONL file, return (cwd, cost, output_tokens, seen_ids, duration_ms).
+
+    For each unique msg.id, picks the most informative variant: a terminal
+    stop_reason beats None, and among ties the entry with the largest
+    output_tokens wins (handles streaming partial snapshots correctly).
+    Duration sums consecutive timestamp deltas below _IDLE_GAP_S so a session
+    left open overnight doesn't inflate the total.
+    """
     cwd: str | None = None
-    cost = 0.0
-    output_tokens = 0
-    seen_ids: set[str] = set()
-    first_ts: str | None = None
-    last_ts: str | None = None
+    timestamps: list[datetime] = []
+    msgs: dict[str, tuple[str, dict, bool]] = {}  # mid -> (model, usage, has_terminal_stop_reason)
+
     try:
         with jsonl_file.open("rb") as f:
             for line in f:
-                if b'"usage"' in line and b'"assistant"' in line:
-                    try:
-                        obj = orjson.loads(line)
-                        if cwd is None:
+                has_usage_assistant = b'"usage"' in line and b'"assistant"' in line
+                has_timestamp = b'"timestamp"' in line
+                if not has_usage_assistant and not has_timestamp:
+                    if cwd is None and b'"cwd"' in line:
+                        try:
+                            obj = orjson.loads(line)
                             c = obj.get("cwd")
                             if c:
                                 cwd = c
-                        ts = obj.get("timestamp")
-                        if ts:
-                            if first_ts is None:
-                                first_ts = ts
-                            last_ts = ts
-                        msg = obj.get("message")
-                        if not msg:
-                            continue
-                        if (
-                            msg.get("role") == "assistant"
-                            and msg.get("stop_reason") in ("end_turn", "tool_use")
-                            and msg.get("usage")
-                        ):
-                            mid = msg.get("id", "")
-                            if mid in seen_ids:
-                                continue
-                            seen_ids.add(mid)
-                            model = msg.get("model", "")
-                            u = msg["usage"]
-                            pk = _pkey(model)
-                            if not pk or pk not in PRICE:
-                                continue
-                            p = PRICE[pk]
-                            inp = u.get("input_tokens", 0)
-                            out = u.get("output_tokens", 0)
-                            cr = u.get("cache_read_input_tokens", 0)
-                            cw_total, cw_1h = _cw_split(u)
-                            cost += (
-                                inp * p[0]
-                                + out * p[1]
-                                + cr * p[0] * CACHE_READ_MULTIPLIER
-                            ) / 1e6 + _cw_cost(cw_total, cw_1h, p[0])
-                            output_tokens += out
-                    except (orjson.JSONDecodeError, ValueError, TypeError):
-                        continue
-                elif b'"timestamp"' in line:
+                        except Exception:
+                            pass
+                    continue
+                try:
+                    obj = orjson.loads(line)
+                except (orjson.JSONDecodeError, ValueError, TypeError):
+                    continue
+                if cwd is None:
+                    c = obj.get("cwd")
+                    if c:
+                        cwd = c
+                ts = obj.get("timestamp")
+                if ts:
                     try:
-                        obj = orjson.loads(line)
-                        if cwd is None:
-                            c = obj.get("cwd")
-                            if c:
-                                cwd = c
-                        ts = obj.get("timestamp")
-                        if ts:
-                            if first_ts is None:
-                                first_ts = ts
-                            last_ts = ts
+                        timestamps.append(datetime.fromisoformat(ts.replace("Z", "+00:00")))
                     except Exception:
                         pass
-                elif cwd is None and b'"cwd"' in line:
-                    try:
-                        obj = orjson.loads(line)
-                        c = obj.get("cwd")
-                        if c:
-                            cwd = c
-                    except Exception:
-                        pass
+                if not has_usage_assistant:
+                    continue
+                msg = obj.get("message")
+                if not msg or msg.get("role") != "assistant":
+                    continue
+                u = msg.get("usage")
+                if not u:
+                    continue
+                mid = msg.get("id", "")
+                if not mid:
+                    continue
+                terminal = msg.get("stop_reason") in _TERMINAL_STOP_REASONS
+                cur = msgs.get(mid)
+                if cur is None:
+                    msgs[mid] = (msg.get("model", ""), u, terminal)
+                else:
+                    _, cur_u, cur_terminal = cur
+                    if (terminal and not cur_terminal) or (
+                        terminal == cur_terminal
+                        and u.get("output_tokens", 0) > cur_u.get("output_tokens", 0)
+                    ):
+                        msgs[mid] = (msg.get("model", ""), u, terminal)
     except OSError:
         pass
+
+    cost = 0.0
+    output_tokens = 0
+    for model, u, _ in msgs.values():
+        pk = _pkey(model)
+        if not pk or pk not in PRICE:
+            continue
+        p = PRICE[pk]
+        inp = u.get("input_tokens", 0)
+        out = u.get("output_tokens", 0)
+        cr = u.get("cache_read_input_tokens", 0)
+        cw_total, cw_1h = _cw_split(u)
+        cost += (
+            inp * p[0] + out * p[1] + cr * p[0] * CACHE_READ_MULTIPLIER
+        ) / 1e6 + _cw_cost(cw_total, cw_1h, p[0])
+        output_tokens += out
+
     duration_ms = 0
-    if first_ts and last_ts and first_ts != last_ts:
-        try:
-            t0 = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
-            t1 = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
-            duration_ms = max(0, int((t1 - t0).total_seconds() * 1000))
-        except Exception:
-            pass
-    return cwd, cost, output_tokens, seen_ids, duration_ms
+    if len(timestamps) >= 2:
+        timestamps.sort()
+        active_s = 0.0
+        for i in range(1, len(timestamps)):
+            delta = (timestamps[i] - timestamps[i - 1]).total_seconds()
+            if 0 < delta < _IDLE_GAP_S:
+                active_s += delta
+        duration_ms = int(active_s * 1000)
+    return cwd, cost, output_tokens, set(msgs.keys()), duration_ms
 
 
 def _load_cache(cache_path: Path) -> dict:
@@ -353,12 +366,13 @@ def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
         return []
 
     # Store cache in repo's .cache dir, not inside ~/.claude/projects/
-    # v2: costs recomputed with TTL-aware cache-write pricing (5m 1.25x / 1h 2x).
+    # v3: per-mid dedup picks largest-output variant (no stop_reason filter)
+    # and duration is gap-aware, so cached costs/durations from v2 are stale.
     import hashlib
     base_key = "|".join(str(b) for b in bases)
     base_hash = hashlib.md5(base_key.encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    cache_path = cache_dir / f"claude-projects2-{base_hash}.json"
+    cache_path = cache_dir / f"claude-projects3-{base_hash}.json"
     cache = _load_cache(cache_path)
     cache_dirty = False
 
@@ -646,11 +660,17 @@ def _parse_session_events(
     """Parse one JSONL file into per-message events for daily aggregation.
 
     Returns a list of tuples: (day_str, role, mid, tool_count, output_tokens).
-    - role is "u" for user turns, "a" for completed assistant turns.
+    - role is "u" for user turns, "a" for assistant turns.
+    - Each unique msg.id emits exactly one assistant event, picking the
+      variant with a terminal stop_reason and largest output_tokens (handles
+      streaming partials and recovers messages whose stop_reason was never
+      finalized in the log).
     - Assistant mids let the aggregator dedup messages that appear in multiple
       session files (e.g. subagent replay), which otherwise inflates daily counts.
     """
-    events: list[tuple[str, str, str, int, int]] = []
+    user_events: list[tuple[str, str, str, int, int]] = []
+    # mid -> (day_str, tool_count, output_tokens, terminal)
+    asst_by_mid: dict[str, tuple[str, int, int, bool]] = {}
     try:
         with jsonl_file.open("rb") as f:
             for line in f:
@@ -679,12 +699,11 @@ def _parse_session_events(
                     continue
                 role = msg.get("role")
                 if role == "user":
-                    events.append((day_str, "u", "", 0, 0))
-                elif role == "assistant" and msg.get("stop_reason") in (
-                    "end_turn",
-                    "tool_use",
-                ):
+                    user_events.append((day_str, "u", "", 0, 0))
+                elif role == "assistant":
                     mid = msg.get("id", "") or ""
+                    if not mid:
+                        continue
                     content = msg.get("content", [])
                     tool_count = 0
                     if isinstance(content, list):
@@ -695,10 +714,22 @@ def _parse_session_events(
                         )
                     usage = msg.get("usage") or {}
                     otoks = usage.get("output_tokens", 0) or 0
-                    events.append((day_str, "a", mid, tool_count, otoks))
+                    terminal = msg.get("stop_reason") in _TERMINAL_STOP_REASONS
+                    cur = asst_by_mid.get(mid)
+                    if cur is None:
+                        asst_by_mid[mid] = (day_str, tool_count, otoks, terminal)
+                    else:
+                        _, cur_tools, cur_otoks, cur_terminal = cur
+                        if (terminal and not cur_terminal) or (
+                            terminal == cur_terminal and otoks > cur_otoks
+                        ):
+                            asst_by_mid[mid] = (day_str, tool_count, otoks, terminal)
     except OSError:
         pass
 
+    events = list(user_events)
+    for mid, (day_str, tool_count, otoks, _) in asst_by_mid.items():
+        events.append((day_str, "a", mid, tool_count, otoks))
     return events
 
 
@@ -716,9 +747,9 @@ def _build_daily_from_sessions(
     dirs_str = ":".join(sorted(str(d) for d in projects_dirs))
     dirs_hash = hashlib.md5(dirs_str.encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    # v2: caches per-message events (not per-file daily aggregates) so dedup
-    # can happen globally at aggregation time.
-    cache_path = cache_dir / f"claude-daily2-{dirs_hash}.json"
+    # v3: per-mid dedup in _parse_session_events picks largest-output variant
+    # and admits messages whose stop_reason was never finalized in the log.
+    cache_path = cache_dir / f"claude-daily3-{dirs_hash}.json"
     cache = _load_cache(cache_path)
     cache_dirty = False
 
