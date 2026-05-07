@@ -275,7 +275,10 @@ def _parse_session_file(
         if not ctx_times:
             return "unknown"
         i = bisect_right(ctx_times, dt) - 1
-        return ctx_models[i] if i >= 0 else "unknown"
+        # Forked subagent sessions emit token snapshots (inherited from the
+        # parent) before their first turn_context. Backfill those with the
+        # session's first known model rather than dropping them as "unknown".
+        return ctx_models[i] if i >= 0 else ctx_models[0]
 
     token_snapshots.sort(key=lambda x: x[0])
     prev = _TokenUsage()

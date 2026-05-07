@@ -5,7 +5,7 @@
 # Configure remote hosts in remotes.conf (one hostname per line).
 # Data is stored in .cache/remotes/<host>/.
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CACHE_DIR="$SCRIPT_DIR/.cache/remotes"
@@ -16,40 +16,49 @@ if [[ ! -f "$CONF" ]]; then
     exit 1
 fi
 
-while IFS= read -r host || [[ -n "$host" ]]; do
-    # Skip empty lines and comments
-    [[ -z "$host" || "$host" == \#* ]] && continue
+# Bound SSH connect time (default is minutes on flaky networks) and never
+# prompt for a password — fail fast if auth doesn't work non-interactively.
+RSH='ssh -o ConnectTimeout=5 -o BatchMode=yes'
 
+sync_host() {
+    local host="$1"
+    local dest="$CACHE_DIR/$host"
     echo "Syncing $host..."
-    dest="$CACHE_DIR/$host"
     mkdir -p "$dest/claude" "$dest/codex"
 
-    # Claude Code: stats-cache, history, projects metadata
-    rsync -az --timeout=10 \
+    rsync -az --timeout=10 -e "$RSH" \
         "$host:.claude/stats-cache.json" \
         "$dest/claude/stats-cache.json" 2>/dev/null || true
 
-    rsync -az --timeout=10 \
+    rsync -az --timeout=10 -e "$RSH" \
         "$host:.claude/history.jsonl" \
         "$dest/claude/history.jsonl" 2>/dev/null || true
 
-    # .claude.json lives in $HOME, contains project cost data
-    rsync -az --timeout=10 \
+    rsync -az --timeout=10 -e "$RSH" \
         "$host:.claude.json" \
         "$dest/claude/.claude.json" 2>/dev/null || true
 
-    # Claude Code: project session logs (JSONL only, skip tool-results)
-    rsync -az --timeout=30 \
+    rsync -az --timeout=30 -e "$RSH" \
         --include='*/' --include='*.jsonl' --exclude='*' \
         "$host:.claude/projects/" \
         "$dest/claude/projects/" 2>/dev/null || true
 
-    # Codex: session files
-    rsync -az --timeout=10 \
+    rsync -az --timeout=10 -e "$RSH" \
         "$host:.codex/sessions/" \
         "$dest/codex/sessions/" 2>/dev/null || true
 
-    echo "  Done."
+    echo "  $host done."
+}
+
+pids=()
+while IFS= read -r host || [[ -n "$host" ]]; do
+    [[ -z "$host" || "$host" == \#* ]] && continue
+    sync_host "$host" &
+    pids+=($!)
 done < "$CONF"
+
+for pid in "${pids[@]}"; do
+    wait "$pid" || true
+done
 
 echo "Sync complete. Data in $CACHE_DIR"

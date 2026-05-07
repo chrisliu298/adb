@@ -6,6 +6,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from copy import copy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
@@ -129,6 +130,7 @@ def _load_machine(
 
 
 SYNC_SCRIPT = REPO_DIR / "sync.sh"
+STALE_HOURS = 6
 
 
 def _sync_remotes() -> None:
@@ -137,12 +139,21 @@ def _sync_remotes() -> None:
         return
     import subprocess
 
-    subprocess.run(
-        [str(SYNC_SCRIPT)],
-        cwd=str(REPO_DIR),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    subprocess.run([str(SYNC_SCRIPT)], cwd=str(REPO_DIR))
+
+
+def _remote_cache_age_hours(hosts: list[str]) -> float | None:
+    """Hours since the newest sync-touched file across hosts. None if no cache."""
+    mtimes: list[float] = []
+    for host in hosts:
+        base = REMOTE_CACHE / host
+        for rel in ("claude/history.jsonl", "claude/stats-cache.json", "codex/sessions"):
+            p = base / rel
+            if p.exists():
+                mtimes.append(p.stat().st_mtime)
+    if not mtimes:
+        return None
+    return (time.time() - max(mtimes)) / 3600
 
 
 def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[ToolStats | None, ToolStats | None, MachineData]:
@@ -150,7 +161,8 @@ def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[Too
 
     machines: list of machine names to include. None or ["all"] means local + all remotes.
               ["local"] means local only. Otherwise, include local + named remotes.
-    sync: if True, run sync.sh to pull fresh data from remotes before reading.
+    sync: if True, force a fresh sync.sh run; otherwise sync only when the
+          remote cache is missing or older than STALE_HOURS.
     """
     # Build work items: (name, claude_kwargs, codex_kwargs)
     work: list[tuple[str, dict | None, dict | None]] = []
@@ -167,24 +179,40 @@ def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[Too
     else:
         include_remotes = [h for h in machines if h in all_remotes]
 
-    # Sync remotes if explicitly requested
-    if sync and include_remotes:
-        _sync_remotes()
+    # Sync remotes when forced (--sync) or when cache is stale/missing.
+    if include_remotes:
+        if sync:
+            console.print("[grey50]Syncing remotes (forced)...[/grey50]")
+            _sync_remotes()
+        else:
+            age = _remote_cache_age_hours(include_remotes)
+            if age is None:
+                console.print("[grey50]No remote cache found — syncing...[/grey50]")
+                _sync_remotes()
+            elif age > STALE_HOURS:
+                console.print(f"[grey50]Remote cache {age:.0f}h old — syncing...[/grey50]")
+                _sync_remotes()
 
     for host in include_remotes:
         base = REMOTE_CACHE / host
         ck = None
         claude_stats = base / "claude" / "stats-cache.json"
         if claude_stats.exists():
-            # Prefer recall-sync staging dir (.remote-<host>) over adb cache —
-            # it's a superset (never deletes) and avoids double-counting since
-            # _iter_project_dirs skips .remote-* dirs in the local parse.
+            # Combine rsync cache (fresh, refreshed by sync.sh) with the
+            # recall-sync staging dir (.remote-<host>) which preserves older
+            # sessions that have been rotated off the remote since.
+            # msg.id dedup at the parser level handles any overlap.
+            project_bases: list[Path] = []
+            rsync_projects = base / "claude" / "projects"
+            if rsync_projects.is_dir():
+                project_bases.append(rsync_projects)
             staging = Path.home() / ".claude" / "projects" / f".remote-{host}"
-            projects = staging if staging.is_dir() else base / "claude" / "projects"
+            if staging.is_dir():
+                project_bases.append(staging)
             ck = dict(
                 stats_path=claude_stats,
                 history_path=base / "claude" / "history.jsonl",
-                projects_base=projects,
+                projects_base=project_bases,
             )
         xk = None
         codex_sessions = base / "codex" / "sessions"
@@ -854,7 +882,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--sync", action="store_true",
-        help="sync remote machine data (via rsync) before reading",
+        help=f"force a remote sync (otherwise auto-runs only when cache > {STALE_HOURS}h old)",
     )
     args = ap.parse_args()
 

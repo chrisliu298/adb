@@ -341,19 +341,22 @@ def _save_cache(cache_path: Path, cache: dict) -> None:
         pass
 
 
-def _load_projects_from_sessions(projects_base: Path) -> list[ProjectInfo]:
+def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
     """Compute cumulative per-project costs from session conversation logs.
 
-    Uses an incremental file-level cache keyed by (size, mtime_ns) to avoid
-    re-parsing unchanged files on subsequent runs.
+    Accepts a Path or a list of Paths. Uses an incremental file-level cache
+    keyed by (size, mtime_ns) to avoid re-parsing unchanged files.
     """
-    if not projects_base.exists():
+    bases = [projects_base] if isinstance(projects_base, Path) else list(projects_base)
+    bases = [b for b in bases if b.exists()]
+    if not bases:
         return []
 
     # Store cache in repo's .cache dir, not inside ~/.claude/projects/
     # v2: costs recomputed with TTL-aware cache-write pricing (5m 1.25x / 1h 2x).
     import hashlib
-    base_hash = hashlib.md5(str(projects_base).encode()).hexdigest()[:12]
+    base_key = "|".join(str(b) for b in bases)
+    base_hash = hashlib.md5(base_key.encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
     cache_path = cache_dir / f"claude-projects2-{base_hash}.json"
     cache = _load_cache(cache_path)
@@ -366,7 +369,7 @@ def _load_projects_from_sessions(projects_base: Path) -> list[ProjectInfo]:
     project_paths: dict[str, str] = {}
     seen_ids: set[str] = set()
 
-    for proj_key, proj_dir in _iter_project_dirs(projects_base):
+    for proj_key, proj_dir in _iter_project_dirs(bases):
         for jsonl_file in proj_dir.rglob("*.jsonl"):
             fpath = str(jsonl_file)
             try:
@@ -450,17 +453,22 @@ def _load_projects_from_sessions(projects_base: Path) -> list[ProjectInfo]:
 PROJECTS_BASE = Path.home() / ".claude" / "projects"
 
 
-def _iter_project_dirs(projects_base: Path):
+def _iter_project_dirs(projects_base):
     """Yield (proj_key, proj_dir) for each project directory.
 
-    Skips dot-prefixed directories (including .remote-<host>/ staging dirs).
+    Accepts a Path or a list of Paths; iterates each base in order and skips
+    dot-prefixed directories (including .remote-<host>/ staging dirs).
     Remote staging dirs are handled by load_all() in adb.py, which passes
     them as projects_base for the corresponding remote host.
     """
-    for entry in projects_base.iterdir():
-        if not entry.is_dir() or entry.name.startswith("."):
+    bases = [projects_base] if isinstance(projects_base, Path) else list(projects_base)
+    for base in bases:
+        if not base.exists():
             continue
-        yield entry.name, entry
+        for entry in base.iterdir():
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            yield entry.name, entry
 
 
 def _discover_project_dirs(projects_base: Path) -> list[Path]:
@@ -787,7 +795,7 @@ def parse(
     *,
     stats_path: Path = STATS,
     history_path: Path = HISTORY,
-    projects_base: Path = PROJECTS_BASE,
+    projects_base = PROJECTS_BASE,
 ) -> ToolStats | None:
     """Parse Claude Code stats. Returns None if no data available."""
     if not stats_path.exists():
@@ -826,8 +834,18 @@ def parse(
             continue
         sc_daily_output[dt] = sum(d.get("tokensByModel", {}).values())
 
-    # Token breakdown: merge JSONL session files + stats-cache, taking max per model
-    projects_dirs = _discover_project_dirs(projects_base)
+    # Token breakdown: merge JSONL session files + stats-cache, taking max per model.
+    # projects_base may be a single Path (default/local) or a list of Paths
+    # (remote: rsync cache + recall-sync staging dir).
+    _bases = [projects_base] if isinstance(projects_base, Path) else list(projects_base)
+    projects_dirs: list[Path] = []
+    _seen_resolved: set[str] = set()
+    for _b in _bases:
+        for _d in _discover_project_dirs(_b):
+            r = str(_d.resolve())
+            if r not in _seen_resolved:
+                _seen_resolved.add(r)
+                projects_dirs.append(_d)
 
     # Session-derived daily — the authoritative source when available.
     session_daily = _build_daily_from_sessions(projects_dirs)
@@ -947,7 +965,7 @@ def parse(
     longest_msgs = ls.get("messageCount", 0)
 
     # Projects (from session logs for cumulative costs)
-    projects = _load_projects_from_sessions(projects_base)
+    projects = _load_projects_from_sessions(_bases)
 
     return ToolStats(
         source="claude",
