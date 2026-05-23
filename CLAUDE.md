@@ -44,7 +44,7 @@ No tests, no linter, no build step. Python 3.10+, dependencies: `httpx`, `orjson
 
 ### Cost computation
 
-- **Claude:** Cost = tokens × per-model price from `PRICE` dict. Cache read at 0.1× input price. Cache write is TTL-aware: 5-minute buckets at 1.25× input, 1-hour buckets at 2× input. The split is read per-message from `usage.cache_creation.ephemeral_{5m,1h}_input_tokens`; when only the summed `cacheCreationInputTokens` is available (stats-cache.json path), tokens are treated as 1-hour since that's what Claude Code currently uses. Per-project costs are computed by parsing individual session JSONL files.
+- **Claude:** Cost = tokens × per-model price from `PRICE` dict. By default cache read is at 0.1× input price and cache write is TTL-aware: 5-minute buckets at 1.25× input, 1-hour buckets at 2× input. The split is read per-message from `usage.cache_creation.ephemeral_{5m,1h}_input_tokens`; when only the summed `cacheCreationInputTokens` is available (stats-cache.json path), tokens are treated as 1-hour since that's what Claude Code currently uses. Non-Anthropic models routed through Claude Code (e.g. DeepSeek via `ANTHROPIC_BASE_URL`) override cache pricing via `CACHE_OVERRIDES` — absolute `(cache_read, cw_5m, cw_1h)` $/MTok per model. Per-project costs are computed by parsing individual session JSONL files.
 - **Codex:** Token snapshots are cumulative counters; the parser computes deltas between consecutive snapshots, handling counter resets. Model names are normalized before pricing lookup.
 - **Recent section:** Estimates cost by multiplying output tokens by a global cost-per-output-token ratio (total_cost / total_output_tokens), not by re-pricing each model.
 
@@ -54,5 +54,5 @@ Parsing is optimized with: `orjson` for fast JSON parsing, byte-level pre-filter
 
 ### Adding new model pricing
 
-- Claude: Add entry to `PRICE` dict in `parser/parsers/claude.py` (key format: `"model-name"`, value: `[input_per_mtok, output_per_mtok]`). Update `_pkey()` if the model name pattern differs.
+- Claude: Add entry to `PRICE` dict in `parser/parsers/claude.py` (key format: `"model-name"`, value: `[input_per_mtok, output_per_mtok]`). Update `_pkey()` if the model name pattern differs. If the model has non-Anthropic cache pricing (cache_read ≠ 0.1× input, or no cache-write premium), add an entry to `CACHE_OVERRIDES` with absolute `(cache_read, cw_5m, cw_1h)` $/MTok prices.
 - Codex: Add entry to `MODEL_PRICING` dict in `parser/parsers/codex.py`. Update `_normalize_model()` if the model has a new suffix pattern.

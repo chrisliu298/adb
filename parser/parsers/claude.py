@@ -40,7 +40,29 @@ PRICE: dict[str, list[float]] = {
     "sonnet-4-6": [3, 15],
     "sonnet-4-5": [3, 15],
     "haiku-4-5": [1, 5],
+    "deepseek-v4-pro": [0.435, 0.87],
+    "deepseek-v4-flash": [0.14, 0.28],
 }
+
+# Per-model cache pricing overrides as absolute $/MTok: (cache_read, cw_5m, cw_1h).
+# Default (when key absent) derives from input price via the multipliers above.
+# DeepSeek publishes explicit cache-hit pricing and has no cache-write premium, so
+# writes are priced at the cache-miss (input) rate for both TTL buckets.
+CACHE_OVERRIDES: dict[str, tuple[float, float, float]] = {
+    "deepseek-v4-pro": (0.003625, 0.435, 0.435),
+    "deepseek-v4-flash": (0.0028, 0.14, 0.14),
+}
+
+
+def _cache_rates(pk: str, input_price: float) -> tuple[float, float, float]:
+    """Return ($/MTok) for (cache_read, cw_5m, cw_1h) for the given model key."""
+    if pk in CACHE_OVERRIDES:
+        return CACHE_OVERRIDES[pk]
+    return (
+        input_price * CACHE_READ_MULTIPLIER,
+        input_price * CACHE_WRITE_5M_MULTIPLIER,
+        input_price * CACHE_WRITE_1H_MULTIPLIER,
+    )
 
 
 def _pkey(model: str) -> str | None:
@@ -63,13 +85,10 @@ def _cw_split(u: dict) -> tuple[int, int]:
     return cw_total, cw_1h
 
 
-def _cw_cost(cw_total: int, cw_1h: int, input_price: float) -> float:
-    """Cost for cache-write tokens, priced per TTL bucket."""
+def _cw_cost(cw_total: int, cw_1h: int, cw_5m_price: float, cw_1h_price: float) -> float:
+    """Cost for cache-write tokens, priced per TTL bucket. Prices are $/MTok."""
     cw_5m = max(0, cw_total - cw_1h)
-    return (
-        cw_5m * input_price * CACHE_WRITE_5M_MULTIPLIER
-        + cw_1h * input_price * CACHE_WRITE_1H_MULTIPLIER
-    ) / 1e6
+    return (cw_5m * cw_5m_price + cw_1h * cw_1h_price) / 1e6
 
 
 def _freset(s: str) -> str:
@@ -316,13 +335,14 @@ def _parse_one_session_file(
         if not pk or pk not in PRICE:
             continue
         p = PRICE[pk]
+        cr_price, cw_5m_price, cw_1h_price = _cache_rates(pk, p[0])
         inp = u.get("input_tokens", 0)
         out = u.get("output_tokens", 0)
         cr = u.get("cache_read_input_tokens", 0)
         cw_total, cw_1h = _cw_split(u)
-        cost += (
-            inp * p[0] + out * p[1] + cr * p[0] * CACHE_READ_MULTIPLIER
-        ) / 1e6 + _cw_cost(cw_total, cw_1h, p[0])
+        cost += (inp * p[0] + out * p[1] + cr * cr_price) / 1e6 + _cw_cost(
+            cw_total, cw_1h, cw_5m_price, cw_1h_price
+        )
         output_tokens += out
 
     duration_ms = 0
@@ -951,11 +971,14 @@ def parse(
         c = 0.0
         if pk and pk in PRICE:
             p = PRICE[pk]
-            cw_cost = _cw_cost(tb.cache_write_tokens, tb.cache_write_1h_tokens, p[0])
+            cr_price, cw_5m_price, cw_1h_price = _cache_rates(pk, p[0])
+            cw_cost = _cw_cost(
+                tb.cache_write_tokens, tb.cache_write_1h_tokens, cw_5m_price, cw_1h_price
+            )
             c = (
                 tb.input_tokens * p[0]
                 + tb.output_tokens * p[1]
-                + tb.cache_read_tokens * (p[0] * CACHE_READ_MULTIPLIER)
+                + tb.cache_read_tokens * cr_price
             ) / 1e6 + cw_cost
             cb.input_tokens += tb.input_tokens
             cb.output_tokens += tb.output_tokens
@@ -963,7 +986,7 @@ def parse(
             cb.cache_write_tokens += tb.cache_write_tokens
             cb.input_cost += tb.input_tokens * p[0] / 1e6
             cb.output_cost += tb.output_tokens * p[1] / 1e6
-            cb.cache_read_cost += tb.cache_read_tokens * (p[0] * CACHE_READ_MULTIPLIER) / 1e6
+            cb.cache_read_cost += tb.cache_read_tokens * cr_price / 1e6
             cb.cache_write_cost += cw_cost
         model_costs[m] = c
 
