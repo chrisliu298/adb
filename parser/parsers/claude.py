@@ -42,6 +42,10 @@ PRICE: dict[str, list[float]] = {
     "haiku-4-5": [1, 5],
     "deepseek-v4-pro": [0.435, 0.87],
     "deepseek-v4-flash": [0.14, 0.28],
+    # mimo-v2.5-pro must precede mimo-v2.5: the latter is a substring of the
+    # former and _pkey() returns the first matching key.
+    "mimo-v2.5-pro": [0.435, 0.87],
+    "mimo-v2.5": [0.14, 0.28],
 }
 
 # Per-model cache pricing overrides as absolute $/MTok: (cache_read, cw_5m, cw_1h).
@@ -51,6 +55,10 @@ PRICE: dict[str, list[float]] = {
 CACHE_OVERRIDES: dict[str, tuple[float, float, float]] = {
     "deepseek-v4-pro": (0.003625, 0.435, 0.435),
     "deepseek-v4-flash": (0.0028, 0.14, 0.14),
+    # MiMo publishes explicit cache-hit pricing and has no cache-write premium,
+    # so writes price at the cache-miss (input) rate for both TTL buckets.
+    "mimo-v2.5-pro": (0.0036, 0.435, 0.435),
+    "mimo-v2.5": (0.0028, 0.14, 0.14),
 }
 
 
