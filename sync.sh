@@ -47,6 +47,16 @@ sync_host() {
         "$host:.codex/sessions/" \
         "$dest/codex/sessions/" 2>/dev/null || true
 
+    # Some tools run Codex against a shadow CODEX_HOME (e.g. task-synth uses
+    # ~/.task-synth-codex, taskforge uses ~/.codex-taskforge) so their rollouts
+    # never land in ~/.codex/sessions. Merge those into the same sessions tree —
+    # rollouts are self-contained and there's no --delete, so merging is safe.
+    for ch in .task-synth-codex .codex-taskforge; do
+        rsync -az --timeout=10 -e "$RSH" \
+            "$host:$ch/sessions/" \
+            "$dest/codex/sessions/" 2>/dev/null || true
+    done
+
     echo "  $host done."
 }
 
