@@ -548,19 +548,19 @@ def print_stats(
     # Stats ribbon — left-aligned
     sep = " · "
     ribbon = Text()
-    ribbon.append(f"{total_sessions:,} sessions", style="grey62")
+    ribbon.append(f"{total_sessions:,} sess", style="grey62")
     ribbon.append(sep, style="grey37")
-    ribbon.append(f"{fmt_tokens(total_tokens)} tokens", style="grey62")
+    ribbon.append(f"{fmt_tokens(total_tokens)} tok", style="grey62")
     ribbon.append(sep, style="grey37")
-    ribbon.append(f"{days_active} days", style="grey62")
+    ribbon.append(f"{days_active}d", style="grey62")
     ribbon.append(sep, style="grey37")
-    ribbon.append(f"{fmt_cost(avg_cost)}/day", style=ACCENT)
+    ribbon.append(f"{fmt_cost(avg_cost)}/d", style=ACCENT)
     ribbon.append(sep, style="grey37")
-    ribbon.append(f"{avg_msgs:,.0f} msgs/day", style="grey62")
+    ribbon.append(f"{avg_msgs:,.0f} msg/d", style="grey62")
     ribbon.append(sep, style="grey37")
-    ribbon.append(f"{avg_sessions:,.0f} sess/day", style="grey62")
+    ribbon.append(f"{avg_sessions:,.0f} sess/d", style="grey62")
     ribbon.append(sep, style="grey37")
-    ribbon.append(f"{streak}-day streak", style="grey62")
+    ribbon.append(f"{streak}d streak", style="grey62")
 
     # Rate limit gauges
     gauge_lines: list[Text] = []
