@@ -47,6 +47,7 @@ PRICE: dict[str, list[float]] = {
     # former and _pkey() returns the first matching key.
     "mimo-v2.5-pro": [0.435, 0.87],
     "mimo-v2.5": [0.14, 0.28],
+    "minimax-m3": [0.6, 2.4],
 }
 
 # Per-model cache pricing overrides as absolute $/MTok: (cache_read, cw_5m, cw_1h).
@@ -60,6 +61,10 @@ CACHE_OVERRIDES: dict[str, tuple[float, float, float]] = {
     # so writes price at the cache-miss (input) rate for both TTL buckets.
     "mimo-v2.5-pro": (0.0036, 0.435, 0.435),
     "mimo-v2.5": (0.0028, 0.14, 0.14),
+    # MiniMax M3 publishes an explicit cache-read price ($0.12/MTok) and no
+    # cache-write premium, so writes price at the cache-miss (input) rate.
+    # Prices are the standard (non-promo) rates for input <= 512k tokens.
+    "minimax-m3": (0.12, 0.6, 0.6),
 }
 
 
