@@ -422,7 +422,7 @@ def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
     seen_ids: set[str] = set()
 
     for proj_key, proj_dir in _iter_project_dirs(bases):
-        for jsonl_file in proj_dir.rglob("*.jsonl"):
+        for jsonl_file in _iter_session_files(proj_dir):
             fpath = str(jsonl_file)
             try:
                 st = jsonl_file.stat()
@@ -523,6 +523,20 @@ def _iter_project_dirs(projects_base):
             yield entry.name, entry
 
 
+def _iter_session_files(proj_dir: Path):
+    """Yield session JSONL files under a project dir, skipping audit.jsonl.
+
+    Claude's local-agent-mode writes a sibling audit.jsonl that replays the same
+    messages as the session log; msg.id dedup keeps it from inflating tokens/cost,
+    but it would still inflate session and (id-less) user-message counts, so it is
+    excluded here. No real session log is named audit.jsonl.
+    """
+    for f in proj_dir.rglob("*.jsonl"):
+        if f.name == "audit.jsonl":
+            continue
+        yield f
+
+
 def _discover_project_dirs(projects_base: Path) -> list[Path]:
     """Discover all Claude Code project directories.
 
@@ -562,20 +576,37 @@ def _discover_project_dirs(projects_base: Path) -> list[Path]:
     except OSError:
         pass
 
+    # macOS "local agent mode" stores sessions outside ~/.claude, under the app
+    # container: local-agent-mode-sessions/<...>/.claude/projects/ (nested a few
+    # uuid levels deep). Discover each embedded projects tree (audit.jsonl mirrors
+    # live above the projects dir and are skipped at read time regardless).
+    if sys.platform == "darwin":
+        lam = home / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
+        if lam.is_dir():
+            try:
+                for projects in lam.glob("**/.claude/projects"):
+                    _add(projects)
+            except OSError:
+                pass
+
     return dirs
 
 
 def _parse_file_tokens_loose(
     jsonl_file: Path,
-) -> list[tuple[str, str, int, int, int, int, int]]:
+) -> list[list]:
     """Parse a single JSONL file with loose filtering for tokens.
 
     Accepts any entry with timestamp + message.usage (no role/stop_reason check).
-    Deduplicates within the file by messageId:requestId composite key.
-    Returns list of (hash_or_empty, model, inp, out, cr, cw_total, cw_1h) per unique entry.
+    Deduplicates within the file by msg.id, keeping the largest-output snapshot
+    (streaming emits growing partials for one message; input/cache counts stay
+    constant across them, so the largest-output line is the most complete).
+    Entries without a msg.id can't be deduped and are all kept. Global cross-file
+    dedup by msg.id is applied later in _aggregate_loose.
+    Returns list of [mid, model, inp, out, cr, cw_total, cw_1h].
     """
-    entries: list[tuple[str, str, int, int, int, int, int]] = []
-    seen: set[str] = set()
+    by_mid: dict[str, list] = {}
+    nomid: list[list] = []
 
     try:
         with jsonl_file.open("rb") as f:
@@ -593,15 +624,6 @@ def _parse_file_tokens_loose(
                 if not msg or not msg.get("usage"):
                     continue
 
-                mid = msg.get("id", "")
-                rid = obj.get("requestId", "")
-                h = ""
-                if mid and rid:
-                    h = f"{mid}:{rid}"
-                    if h in seen:
-                        continue
-                    seen.add(h)
-
                 u = msg["usage"]
                 inp = u.get("input_tokens", 0)
                 out = u.get("output_tokens", 0)
@@ -615,11 +637,60 @@ def _parse_file_tokens_loose(
                 if model == "<synthetic>":
                     model = "unknown"
 
-                entries.append((h, model, inp, out, cr, cw_total, cw_1h))
+                mid = msg.get("id", "") or ""
+                entry = [mid, model, inp, out, cr, cw_total, cw_1h]
+                if mid:
+                    cur = by_mid.get(mid)
+                    if cur is None or out > cur[3]:  # cur[3] = output_tokens
+                        by_mid[mid] = entry
+                else:
+                    nomid.append(entry)
     except OSError:
         pass
 
-    return entries
+    return list(by_mid.values()) + nomid
+
+
+def _aggregate_loose(
+    file_entry_lists: list[list],
+) -> tuple[TokenBreakdown, dict[str, TokenBreakdown]]:
+    """Aggregate per-file loose entries with global msg.id dedup.
+
+    For each msg.id, keep only the largest-output snapshot across all files.
+    Subagent sessions replay a parent message under a *new* requestId, so keying
+    on msg.id alone (not messageId:requestId) counts it once — matching the cost
+    and daily paths, which already dedup by msg.id. Entries without a msg.id
+    can't be deduped and are all counted.
+    """
+    best: dict[str, list] = {}
+    nomid: list[list] = []
+    for entries in file_entry_lists:
+        for e in entries:
+            mid = e[0]
+            if not mid:
+                nomid.append(e)
+                continue
+            cur = best.get(mid)
+            if cur is None or e[3] > cur[3]:  # e[3] = output_tokens
+                best[mid] = e
+
+    total_tokens = TokenBreakdown()
+    models: dict[str, TokenBreakdown] = {}
+    for e in list(best.values()) + nomid:
+        model = e[1]
+        cw_1h = e[6] if len(e) > 6 else 0
+        tb = TokenBreakdown(
+            input_tokens=e[2],
+            output_tokens=e[3],
+            cache_read_tokens=e[4],
+            cache_write_tokens=e[5],
+            cache_write_1h_tokens=cw_1h,
+        )
+        total_tokens.add(tb)
+        if model not in models:
+            models[model] = TokenBreakdown()
+        models[model].add(tb)
+    return total_tokens, models
 
 
 def _load_all_tokens(
@@ -627,28 +698,28 @@ def _load_all_tokens(
 ) -> tuple[TokenBreakdown, dict[str, TokenBreakdown]]:
     """Load token totals from all JSONL files across project dirs.
 
-    Uses loose filtering (any entry with timestamp + message.usage) and
-    messageId:requestId composite dedup. Per-file entry lists are cached.
+    Uses loose filtering (any entry with timestamp + message.usage). Per-file
+    entry lists are cached by (size, mtime); global dedup by msg.id (keeping the
+    largest-output snapshot) is applied in _aggregate_loose.
     """
     import hashlib
 
     dirs_str = ":".join(sorted(str(d) for d in projects_dirs))
     dirs_hash = hashlib.md5(dirs_str.encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    # v2: entries are 7-tuples including cache_write_1h (TTL split)
-    cache_path = cache_dir / f"claude-tokens2-{dirs_hash}.json"
+    # v3: dedup by msg.id keeping the largest-output snapshot. v2 keyed on the
+    # messageId:requestId composite and kept the first occurrence, which dropped
+    # later (larger) streaming output and double-counted requestId-less replays.
+    cache_path = cache_dir / f"claude-tokens3-{dirs_hash}.json"
     cache = _load_cache(cache_path)
     cache_dirty = False
 
-    seen_hashes: set[str] = set()
-    total_tokens = TokenBreakdown()
-    models: dict[str, TokenBreakdown] = {}
-
+    file_entry_lists: list[list] = []
     for projects_base in projects_dirs:
         if not projects_base.exists():
             continue
         for _, proj_dir in _iter_project_dirs(projects_base):
-            for jsonl_file in proj_dir.rglob("*.jsonl"):
+            for jsonl_file in _iter_session_files(proj_dir):
                 fpath = str(jsonl_file)
                 try:
                     st = jsonl_file.stat()
@@ -660,36 +731,15 @@ def _load_all_tokens(
                 if cached_entry and cached_entry.get("k") == fkey:
                     file_entries = cached_entry.get("e", [])
                 else:
-                    raw_entries = _parse_file_tokens_loose(jsonl_file)
-                    file_entries = [list(e) for e in raw_entries]
+                    file_entries = _parse_file_tokens_loose(jsonl_file)
                     cache[fpath] = {"k": fkey, "e": file_entries}
                     cache_dirty = True
-
-                # Exact global dedup per entry
-                for entry in file_entries:
-                    h, model = entry[0], entry[1]
-                    inp, out, cr, cw = entry[2], entry[3], entry[4], entry[5]
-                    cw_1h = entry[6] if len(entry) > 6 else 0
-                    if h:
-                        if h in seen_hashes:
-                            continue
-                        seen_hashes.add(h)
-                    tb = TokenBreakdown(
-                        input_tokens=inp,
-                        output_tokens=out,
-                        cache_read_tokens=cr,
-                        cache_write_tokens=cw,
-                        cache_write_1h_tokens=cw_1h,
-                    )
-                    total_tokens.add(tb)
-                    if model not in models:
-                        models[model] = TokenBreakdown()
-                    models[model].add(tb)
+                file_entry_lists.append(file_entries)
 
     if cache_dirty:
         _save_cache(cache_path, cache)
 
-    return total_tokens, models
+    return _aggregate_loose(file_entry_lists)
 
 
 def _parse_session_events(
@@ -798,7 +848,7 @@ def _build_daily_from_sessions(
         if not projects_base.exists():
             continue
         for _, proj_dir in _iter_project_dirs(projects_base):
-            for jsonl_file in proj_dir.rglob("*.jsonl"):
+            for jsonl_file in _iter_session_files(proj_dir):
                 fpath = str(jsonl_file)
                 try:
                     st = jsonl_file.stat()
@@ -983,6 +1033,10 @@ def parse(
     total_tokens = TokenBreakdown()
     model_costs: dict[str, float] = {}
     cb = CostBreakdown()
+    # Track models with no PRICE match (mirrors the Codex parser) so unpriced
+    # token usage surfaces as a warning instead of silently costing $0.
+    unpriced_models: set[str] = set()
+    unpriced_tokens = 0
     for m, tb in models.items():
         total_tokens.add(tb)
         pk = _pkey(m)
@@ -1006,6 +1060,9 @@ def parse(
             cb.output_cost += tb.output_tokens * p[1] / 1e6
             cb.cache_read_cost += tb.cache_read_tokens * cr_price / 1e6
             cb.cache_write_cost += cw_cost
+        else:
+            unpriced_models.add(m)
+            unpriced_tokens += tb.total
         model_costs[m] = c
 
     total_cost = sum(model_costs.values())
@@ -1057,5 +1114,7 @@ def parse(
         projects=projects,
         longest_session_duration_ms=longest_dur,
         longest_session_messages=longest_msgs,
+        unpriced_models=unpriced_models,
+        unpriced_tokens=unpriced_tokens,
         extra={"tier": tier},
     )
