@@ -370,10 +370,14 @@ def _pricing_for(model: str) -> ModelPricing | None:
     p = MODEL_PRICING.get(base)
     if p is not None:
         return p
-    for key, pricing in MODEL_PRICING.items():
-        if base.startswith(key + "-"):
-            return pricing
-    return None
+    # Prefix fallback: pick the LONGEST matching key, not the first in dict order,
+    # so a variant like gpt-5.3-codex-spark-<x> matches the spark entry rather
+    # than plain gpt-5.3. (gpt-5.4-mini still inherits gpt-5.4 — no mini rate yet.)
+    best_key: str | None = None
+    for key in MODEL_PRICING:
+        if base.startswith(key + "-") and (best_key is None or len(key) > len(best_key)):
+            best_key = key
+    return MODEL_PRICING[best_key] if best_key else None
 
 
 def _fmt_reset(resets_at: int | float | None) -> str:
@@ -416,6 +420,55 @@ def _convert_rate_limits(rl: dict | None) -> list[RateLimitInfo]:
     return limits
 
 
+def _session_id_of(path: Path) -> str | None:
+    """Read a rollout's session id from its session_meta record (at the top of
+    the file). Returns None if not found, so the file is treated as unique."""
+    try:
+        with path.open("rb") as f:
+            for _ in range(5):  # session_meta is the first record
+                line = f.readline()
+                if not line:
+                    break
+                if b'"session_meta"' not in line:
+                    continue
+                try:
+                    o = orjson.loads(line)
+                except orjson.JSONDecodeError:
+                    continue
+                if o.get("type") == "session_meta":
+                    sid = (o.get("payload") or {}).get("id")
+                    return str(sid) if sid else None
+    except OSError:
+        return None
+    return None
+
+
+def _dedup_files_by_session(files: list[Path]) -> list[Path]:
+    """Collapse duplicate rollouts of the same Codex session to a single file.
+
+    A session's rollout can exist in more than one place — e.g. task-synth saves
+    a copy into its task dir while the original lives in the shadow CODEX_HOME.
+    The parser has no cross-file token dedup, so counting both would double the
+    session's tokens. Keep the largest file per session_meta.id (the most
+    complete copy); files with no readable session id are all kept.
+    """
+    best: dict[str, tuple[int, Path]] = {}
+    unkeyed: list[Path] = []
+    for p in files:
+        sid = _session_id_of(p)
+        if not sid:
+            unkeyed.append(p)
+            continue
+        try:
+            size = p.stat().st_size
+        except OSError:
+            size = 0
+        cur = best.get(sid)
+        if cur is None or size > cur[0]:
+            best[sid] = (size, p)
+    return sorted(unkeyed + [p for _, p in best.values()])
+
+
 def _dir_fingerprint(files: list[Path]) -> str:
     """Fast fingerprint: count + max mtime + total size."""
     total_size = 0
@@ -452,7 +505,17 @@ def parse(*, sessions_dir: Path = SESSIONS_DIR) -> ToolStats | None:
     """Parse Codex CLI session logs. Returns None if no data available."""
     if not sessions_dir.exists():
         return None
-    files = sorted(p for p in sessions_dir.rglob("*.jsonl") if p.is_file())
+    # rglob descends into dot-prefixed dirs, so exclude recall-sync staging
+    # mirrors (e.g. .remote-<host>/) parked under the local CODEX_HOME. Those
+    # sessions are already counted under their own host from the rsync cache;
+    # reading them here too would double-count. Mirrors the dot-dir skip the
+    # Claude parser does in _iter_project_dirs.
+    files = sorted(
+        p
+        for p in sessions_dir.rglob("*.jsonl")
+        if p.is_file()
+        and not any(part.startswith(".") for part in p.relative_to(sessions_dir).parts)
+    )
     if not files:
         return None
 
@@ -470,7 +533,10 @@ def parse(*, sessions_dir: Path = SESSIONS_DIR) -> ToolStats | None:
             pass
 
     agg = _Aggregates()
-    for f in files:
+    # Dedup duplicate rollouts of the same session (cold path only; the warm
+    # cache above already covers the unchanged case) so a rollout copied into
+    # multiple homes/dirs is counted once.
+    for f in _dedup_files_by_session(files):
         _parse_session_file(f, agg, since=None)
 
     if not agg.sessions:
