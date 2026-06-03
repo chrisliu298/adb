@@ -26,12 +26,14 @@ class TokenBreakdown:
 
     @property
     def total(self) -> int:
+        # reasoning_tokens is intentionally excluded: for Codex it is a subset
+        # of output_tokens (on-disk total_tokens == input + output), so adding
+        # it here would double-count. For Claude it is always 0.
         return (
             self.input_tokens
             + self.output_tokens
             + self.cache_read_tokens
             + self.cache_write_tokens
-            + self.reasoning_tokens
         )
 
     def add(self, other: TokenBreakdown) -> None:
