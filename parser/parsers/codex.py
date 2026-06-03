@@ -63,11 +63,12 @@ MODEL_PRICING: dict[str, ModelPricing] = {
         cached_input_usd_per_mtok=0.50,
         output_usd_per_mtok=30.0,
     ),
-    # gpt-5.3-codex-spark doesn't match any strip rule, stays as-is (no official API pricing yet)
+    # gpt-5.3-codex-spark doesn't match any strip rule, stays as-is. No official
+    # API pricing yet, so it's priced the same as gpt-5.3-codex (-> gpt-5.3).
     "gpt-5.3-codex-spark": ModelPricing(
-        input_usd_per_mtok=0,
-        cached_input_usd_per_mtok=0,
-        output_usd_per_mtok=0,
+        input_usd_per_mtok=1.75,
+        cached_input_usd_per_mtok=0.175,
+        output_usd_per_mtok=14.0,
     ),
 }
 
