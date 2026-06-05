@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from parser.parsers import claude as claude_parser
 from parser.parsers import codex as codex_parser
+from parser.parsers import grok as grok_parser
 from parser.types import CostBreakdown, DayActivity, ProjectInfo, TokenBreakdown, ToolStats
 
 REPO_DIR = Path(__file__).resolve().parent
@@ -115,18 +116,20 @@ def _merge_stats(stats: list[ToolStats]) -> ToolStats:
     return result
 
 
-MachineData = dict[str, tuple[ToolStats | None, ToolStats | None]]
+MachineData = dict[str, tuple[ToolStats | None, ToolStats | None, ToolStats | None]]
 
 
 def _load_machine(
     name: str,
     claude_kwargs: dict | None,
     codex_kwargs: dict | None,
-) -> tuple[str, ToolStats | None, ToolStats | None]:
+    grok_kwargs: dict | None,
+) -> tuple[str, ToolStats | None, ToolStats | None, ToolStats | None]:
     """Load stats for a single machine. Designed for parallel execution."""
     c = claude_parser.parse(**claude_kwargs) if claude_kwargs is not None else None
     x = codex_parser.parse(**codex_kwargs) if codex_kwargs is not None else None
-    return name, c, x
+    g = grok_parser.parse(**grok_kwargs) if grok_kwargs is not None else None
+    return name, c, x, g
 
 
 SYNC_SCRIPT = REPO_DIR / "sync.sh"
@@ -147,7 +150,7 @@ def _remote_cache_age_hours(hosts: list[str]) -> float | None:
     mtimes: list[float] = []
     for host in hosts:
         base = REMOTE_CACHE / host
-        for rel in ("claude/history.jsonl", "claude/stats-cache.json", "codex/sessions"):
+        for rel in ("claude/history.jsonl", "claude/stats-cache.json", "codex/sessions", "grok/sessions"):
             p = base / rel
             if p.exists():
                 mtimes.append(p.stat().st_mtime)
@@ -156,7 +159,7 @@ def _remote_cache_age_hours(hosts: list[str]) -> float | None:
     return (time.time() - max(mtimes)) / 3600
 
 
-def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[ToolStats | None, ToolStats | None, MachineData]:
+def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[ToolStats | None, ToolStats | None, ToolStats | None, MachineData]:
     """Load and merge stats from local + remote machines.
 
     machines: list of machine names to include. None or ["all"] means local + all remotes.
@@ -164,11 +167,11 @@ def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[Too
     sync: if True, force a fresh sync.sh run; otherwise sync only when the
           remote cache is missing or older than STALE_HOURS.
     """
-    # Build work items: (name, claude_kwargs, codex_kwargs)
-    work: list[tuple[str, dict | None, dict | None]] = []
+    # Build work items: (name, claude_kwargs, codex_kwargs, grok_kwargs)
+    work: list[tuple[str, dict | None, dict | None, dict | None]] = []
 
     # Local machine is always included
-    work.append(("local", {}, {}))
+    work.append(("local", {}, {}, {}))
 
     # Determine which remotes to include
     all_remotes = _load_remote_hosts()
@@ -218,28 +221,36 @@ def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[Too
         codex_sessions = base / "codex" / "sessions"
         if codex_sessions.exists():
             xk = dict(sessions_dir=codex_sessions)
-        if ck is not None or xk is not None:
-            work.append((host, ck, xk))
+        gk = None
+        grok_sessions = base / "grok" / "sessions"
+        if grok_sessions.exists():
+            gk = dict(sessions_dir=grok_sessions)
+        if ck is not None or xk is not None or gk is not None:
+            work.append((host, ck, xk, gk))
 
     # Parse all machines in parallel
     claude_list: list[ToolStats] = []
     codex_list: list[ToolStats] = []
+    grok_list: list[ToolStats] = []
     per_machine: MachineData = {}
 
     with ThreadPoolExecutor(max_workers=len(work)) as pool:
         futures = [pool.submit(_load_machine, *w) for w in work]
         for f in futures:
-            name, c, x = f.result()
+            name, c, x, g = f.result()
             if c:
                 claude_list.append(c)
             if x:
                 codex_list.append(x)
-            if c or x:
-                per_machine[name] = (c, x)
+            if g:
+                grok_list.append(g)
+            if c or x or g:
+                per_machine[name] = (c, x, g)
 
     claude = _merge_stats(claude_list) if claude_list else None
     codex = _merge_stats(codex_list) if codex_list else None
-    return claude, codex, per_machine
+    grok = _merge_stats(grok_list) if grok_list else None
+    return claude, codex, grok, per_machine
 
 
 # ---------------------------------------------------------------------------
@@ -320,10 +331,11 @@ HISTORY_PATH = Path.home() / ".claude" / "history.jsonl"
 def compute_streak(
     claude: ToolStats | None,
     codex: ToolStats | None,
+    grok: ToolStats | None = None,
     per_machine: MachineData | None = None,
 ) -> int:
     active_days: set[date] = set()
-    for s in (claude, codex):
+    for s in (claude, codex, grok):
         if s is None:
             continue
         for d in s.daily:
@@ -358,9 +370,10 @@ def compute_streak(
 def print_stats(
     claude: ToolStats | None,
     codex: ToolStats | None,
+    grok: ToolStats | None = None,
     per_machine: MachineData | None = None,
 ) -> None:
-    stats_list = [s for s in (claude, codex) if s is not None]
+    stats_list = [s for s in (claude, codex, grok) if s is not None]
     combined = _merge_stats(stats_list)
     total_cost = combined.total_cost
     total_tokens = combined.total_tokens.total
@@ -375,7 +388,7 @@ def print_stats(
     for _host in _load_remote_hosts():
         _all_active_days |= _history_active_days(REMOTE_CACHE / _host / "claude" / "history.jsonl")
     days_active = len(_all_active_days)
-    streak = compute_streak(claude, codex)
+    streak = compute_streak(claude, codex, grok)
     daily_by_date = {d.day: d for d in combined.daily}
     merged_models = {m: (tb, combined.model_costs.get(m, 0.0)) for m, tb in combined.models.items()}
     merged_hours = combined.hour_counts
@@ -463,6 +476,9 @@ def print_stats(
     ACCENT_BOLD = f"bold {ACCENT}"
     CLAUDE_COLOR = "#d77757"
     CODEX_COLOR = "#39c5cf"
+    GROK_COLOR = "#c0c0c0"
+    TOOL_COLORS = {"claude": CLAUDE_COLOR, "codex": CODEX_COLOR, "grok": GROK_COLOR}
+    TOOL_NAMES = {"claude": "Claude", "codex": "Codex", "grok": "Grok"}
     COST_COLORS = {
         "Cache Rd": "#5f87d7",
         "Cache Wr": "#d75f87",
@@ -517,30 +533,24 @@ def print_stats(
 
     blank = Text("")
 
-    # Hero line — centered: total cost · tool breakdowns with tiers
-    both_tools = claude is not None and codex is not None
+    # Hero line — centered: total cost · per-tool breakdowns with tiers
     hero_text = Text()
     hero_text.append(fmt_cost(total_cost), style=ACCENT_BOLD)
-    if both_tools:
-        claude_tier = claude.extra.get("tier", "") if claude else ""
-        codex_tier = codex.extra.get("tier", "") if codex else ""
-        hero_text.append(" · ", style="grey37")
-        hero_text.append("Claude", style=CLAUDE_COLOR)
-        hero_text.append(f" {fmt_cost(claude.total_cost)}", style=ACCENT)
-        if claude_tier:
-            hero_text.append(f" ({claude_tier[:1].upper()}{claude_tier[1:]})", style="grey62")
-        hero_text.append(" · ", style="grey37")
-        hero_text.append("Codex", style=CODEX_COLOR)
-        hero_text.append(f" {fmt_cost(codex.total_cost)}", style=ACCENT)
-        if codex_tier:
-            hero_text.append(f" ({codex_tier[:1].upper()}{codex_tier[1:]})", style="grey62")
+    if len(stats_list) > 1:
+        # Multiple tools: show each tool's name + cost (+ tier).
+        for s in stats_list:
+            tier = s.extra.get("tier", "")
+            hero_text.append(" · ", style="grey37")
+            hero_text.append(TOOL_NAMES.get(s.source, s.source.title()), style=TOOL_COLORS.get(s.source, "grey62"))
+            hero_text.append(f" {fmt_cost(s.total_cost)}", style=ACCENT)
+            if tier:
+                hero_text.append(f" ({tier[:1].upper()}{tier[1:]})", style="grey62")
     else:
-        s = claude or codex
-        tool_name = "Claude" if s.source == "claude" else "Codex"
-        tool_color = CLAUDE_COLOR if s.source == "claude" else CODEX_COLOR
+        # Single tool: total already equals its cost, so just name (+ tier).
+        s = stats_list[0]
         tier = s.extra.get("tier", "")
         hero_text.append(" · ", style="grey37")
-        hero_text.append(tool_name, style=tool_color)
+        hero_text.append(TOOL_NAMES.get(s.source, s.source.title()), style=TOOL_COLORS.get(s.source, "grey62"))
         if tier:
             hero_text.append(f" ({tier[:1].upper()}{tier[1:]})", style="grey62")
     hero = hero_text
@@ -568,8 +578,8 @@ def print_stats(
     for s in stats_list:
         if not s.rate_limits:
             continue
-        prefix = "Claude" if s.source == "claude" else "Codex"
-        color = CLAUDE_COLOR if s.source == "claude" else CODEX_COLOR
+        prefix = TOOL_NAMES.get(s.source, s.source.title())
+        color = TOOL_COLORS.get(s.source, "grey62")
         entries = []
         for rl in s.rate_limits:
             entries.append((rl.label, rl.utilization, rl.resets_in))
@@ -709,6 +719,9 @@ def print_stats(
         models_table.add_column("%", justify="right", style="dim", no_wrap=True, min_width=5)
 
         def _model_prices(name: str) -> tuple[float | None, float | None]:
+            gp = grok_parser._pricing_for(name)
+            if gp:
+                return gp.input_usd_per_mtok, gp.output_usd_per_mtok
             pk = claude_parser._pkey(name)
             if pk and pk in claude_parser.PRICE:
                 p = claude_parser.PRICE[pk]
@@ -829,8 +842,8 @@ def print_stats(
     # --- 6. MACHINES ---
     if per_machine and len(per_machine) > 1:
         machine_rows = []
-        for name, (mc, mx) in per_machine.items():
-            m_stats = [s for s in (mc, mx) if s is not None]
+        for name, (mc, mx, mg) in per_machine.items():
+            m_stats = [s for s in (mc, mx, mg) if s is not None]
             m_tokens = sum(s.total_tokens.total for s in m_stats)
             m_sessions = sum(s.total_sessions for s in m_stats)
             m_messages = sum(s.total_messages for s in m_stats)
@@ -886,12 +899,12 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    claude, codex, per_machine = load_all(args.machines, sync=args.sync)
-    stats_list = [s for s in (claude, codex) if s is not None]
+    claude, codex, grok, per_machine = load_all(args.machines, sync=args.sync)
+    stats_list = [s for s in (claude, codex, grok) if s is not None]
     if not stats_list:
         print("No usage data found.")
         sys.exit(1)
-    print_stats(claude, codex, per_machine)
+    print_stats(claude, codex, grok, per_machine)
 
 
 if __name__ == "__main__":

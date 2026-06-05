@@ -24,7 +24,7 @@ sync_host() {
     local host="$1"
     local dest="$CACHE_DIR/$host"
     echo "Syncing $host..."
-    mkdir -p "$dest/claude" "$dest/codex"
+    mkdir -p "$dest/claude" "$dest/codex" "$dest/grok"
 
     rsync -az --timeout=10 -e "$RSH" \
         "$host:.claude/stats-cache.json" \
@@ -69,6 +69,14 @@ sync_host() {
             "$host:$ch/sessions/" \
             "$dest/codex/sessions/" 2>/dev/null || true
     done
+
+    # Grok Build CLI: one self-contained dir per session, no cross-file dedup
+    # needed. --delete prunes ONLY this mirror ($dest), never $host — same
+    # guarantee as the blocks above. Drops sessions rotated off the remote so
+    # they aren't counted forever.
+    rsync -az --timeout=10 --delete -e "$RSH" \
+        "$host:.grok/sessions/" \
+        "$dest/grok/sessions/" 2>/dev/null || true
 
     # task-synth (l40s) saves a copy of each run's Codex rollout into its task
     # dirs as codex_session.jsonl. Most overlap the shadow home above, but some
