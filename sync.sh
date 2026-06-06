@@ -106,3 +106,13 @@ for pid in "${pids[@]}"; do
 done
 
 echo "Sync complete. Data in $CACHE_DIR"
+
+# Capture every synced session into the append-only agent-backups tree (sibling
+# repo) so nothing is lost even if this mirror or a remote is wiped. Append-only
+# and idempotent, so running it on every sync is safe. Non-fatal if it's absent
+# or fails — the sync itself has already succeeded.
+BACKUP="$SCRIPT_DIR/../agent-backups/backup.sh"
+if [[ -x "$BACKUP" ]]; then
+    echo "Backing up sessions (append-only)..."
+    "$BACKUP" || echo "  Backup step failed — run agent-backups/backup.sh manually."
+fi
