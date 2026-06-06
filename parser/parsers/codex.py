@@ -539,7 +539,10 @@ def parse(
 
     # Check cache (stored in repo's .cache dir, not inside ~/.codex/)
     import hashlib
-    base_hash = hashlib.md5("|".join(str(b) for b in bases).encode()).hexdigest()[:12]
+    # NUL-join: cannot appear in a path, so distinct base lists never collide
+    # (a "|" delimiter could, since paths may contain "|"). A single base joins to
+    # itself, keeping the cache key identical to the old single-dir hash.
+    base_hash = hashlib.md5("\x00".join(str(b) for b in bases).encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
     cache_path = cache_dir / f"codex-sessions-{base_hash}.json"
     fp = _dir_fingerprint(files)
