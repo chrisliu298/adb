@@ -843,21 +843,25 @@ def _build_daily_from_sessions(
 
     agg: dict[str, list[int]] = {}  # date → [msgs, sessions, tools, otoks]
     seen_asst_ids: set[str] = set()
-    # Dedup the same session file across this host's bases. A remote host is read
-    # as its rsync mirror PLUS its .remote-<host> staging dir, which hold overlapping
-    # copies of the same session (same <uuid>.jsonl basename). Counting both would
-    # inflate session/message counts (the token path already dedups by msg.id). The
-    # mirror base is iterated first, so the first copy seen is the most current.
-    seen_session_files: set[str] = set()
+    # Dedup the same session FILE across this host's bases, keyed on its path
+    # relative to the base. A remote host is read as its rsync mirror PLUS its
+    # .remote-<host> staging dir, which hold copies of the same session at the
+    # same relative path; counting both would inflate session/message counts (the
+    # token path already dedups by msg.id). Relative-path keying collapses those
+    # copies while keeping distinct files counted once each — including subagent
+    # transcripts, whose agent-<hash>.jsonl basenames are NOT unique, so a
+    # basename key would wrongly merge them.
+    seen_rel_paths: set[str] = set()
 
     for projects_base in projects_dirs:
         if not projects_base.exists():
             continue
         for _, proj_dir in _iter_project_dirs(projects_base):
             for jsonl_file in _iter_session_files(proj_dir):
-                if jsonl_file.name in seen_session_files:
+                relkey = str(jsonl_file.relative_to(projects_base))
+                if relkey in seen_rel_paths:
                     continue
-                seen_session_files.add(jsonl_file.name)
+                seen_rel_paths.add(relkey)
                 fpath = str(jsonl_file)
                 try:
                     st = jsonl_file.stat()
