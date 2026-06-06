@@ -843,12 +843,21 @@ def _build_daily_from_sessions(
 
     agg: dict[str, list[int]] = {}  # date → [msgs, sessions, tools, otoks]
     seen_asst_ids: set[str] = set()
+    # Dedup the same session file across this host's bases. A remote host is read
+    # as its rsync mirror PLUS its .remote-<host> staging dir, which hold overlapping
+    # copies of the same session (same <uuid>.jsonl basename). Counting both would
+    # inflate session/message counts (the token path already dedups by msg.id). The
+    # mirror base is iterated first, so the first copy seen is the most current.
+    seen_session_files: set[str] = set()
 
     for projects_base in projects_dirs:
         if not projects_base.exists():
             continue
         for _, proj_dir in _iter_project_dirs(projects_base):
             for jsonl_file in _iter_session_files(proj_dir):
+                if jsonl_file.name in seen_session_files:
+                    continue
+                seen_session_files.add(jsonl_file.name)
                 fpath = str(jsonl_file)
                 try:
                     st = jsonl_file.stat()
