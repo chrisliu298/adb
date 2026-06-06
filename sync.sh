@@ -38,43 +38,44 @@ sync_host() {
         "$host:.claude.json" \
         "$dest/claude/.claude.json" 2>/dev/null || true
 
-    # --delete prunes ONLY this local mirror ($dest), never the remote source:
-    # rsync --delete removes extraneous files on the RECEIVER, so original data on
-    # $host is never touched. It drops cached *.jsonl that were pruned/rotated off
-    # the remote so they aren't counted forever. Single source, so safe; the
-    # --exclude='*' rule protects non-jsonl receiver files. The local recall-sync
-    # staging dir (.remote-<host>) is a separate tree, untouched.
-    rsync -az --timeout=30 --delete -e "$RSH" \
+    # NO --delete: this mirror is append-only so Claude sessions rotated off the
+    # remote stay counted (the total is cumulative/lifetime). This block used to
+    # --delete on the premise that the .remote-<host> recall-sync staging dir
+    # preserved rotated sessions — but recall-sync was removed 2026-04-26, so that
+    # staging is frozen (newest file 2026-04-24) and no longer backs up sessions
+    # created after that date. Pruning them here dropped them from every source
+    # adb can read, making the lifetime total decrease daily. Append-only keeps
+    # the mirror itself the preservation layer; the parser's global msg.id dedup
+    # (parser/parsers/claude.py _aggregate_loose) collapses overlap with staging.
+    rsync -az --timeout=30 -e "$RSH" \
         --include='*/' --include='*.jsonl' --exclude='*' \
         "$host:.claude/projects/" \
         "$dest/claude/projects/" 2>/dev/null || true
 
-    # --delete here too (Codex has no cross-file dedup, so stale rollouts would
-    # double-count permanently). Same guarantee: it only prunes the mirror $dest,
-    # never $host. The shadow homes below merge into this same dir, so this MUST
-    # run first: --delete mirrors the remote's ~/.codex/sessions (clearing last
-    # run's stale primary AND shadow files from the mirror), then the loop re-adds
-    # the current shadow rollouts. Order matters — do not move the shadow loop above.
-    rsync -az --timeout=10 --delete -e "$RSH" \
+    # NO --delete: this mirror is append-only so Codex sessions rotated off the
+    # remote stay counted (the total is cumulative/lifetime). Stale-rollout
+    # double-counting is handled at the parser level by session_meta.id dedup
+    # (parser/parsers/codex.py _dedup_files_by_session), so pruning isn't needed.
+    # The shadow homes below merge into this same dir; dedup collapses overlaps.
+    rsync -az --timeout=10 -e "$RSH" \
         "$host:.codex/sessions/" \
         "$dest/codex/sessions/" 2>/dev/null || true
 
     # Some tools run Codex against a shadow CODEX_HOME (e.g. task-synth uses
     # ~/.task-synth-codex, taskforge uses ~/.codex-taskforge) so their rollouts
     # never land in ~/.codex/sessions. Merge those into the same sessions tree.
-    # No --delete on these: each would delete the others' files (they share the
-    # dest dir); the primary --delete above already cleared stale shadow rollouts.
+    # No --delete (append-only); the parser's session-id dedup collapses overlap.
     for ch in .task-synth-codex .codex-taskforge; do
         rsync -az --timeout=10 -e "$RSH" \
             "$host:$ch/sessions/" \
             "$dest/codex/sessions/" 2>/dev/null || true
     done
 
-    # Grok Build CLI: one self-contained dir per session, no cross-file dedup
-    # needed. --delete prunes ONLY this mirror ($dest), never $host — same
-    # guarantee as the blocks above. Drops sessions rotated off the remote so
-    # they aren't counted forever.
-    rsync -az --timeout=10 --delete -e "$RSH" \
+    # Grok Build CLI: one self-contained dir per session. NO --delete — this
+    # mirror is append-only so sessions rotated off the remote stay counted in
+    # the cumulative/lifetime total. Grok has no .remote-<host> staging layer,
+    # so the append-only mirror is its only preservation path.
+    rsync -az --timeout=10 -e "$RSH" \
         "$host:.grok/sessions/" \
         "$dest/grok/sessions/" 2>/dev/null || true
 

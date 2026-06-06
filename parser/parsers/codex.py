@@ -501,27 +501,45 @@ def _save_codex_cache(cache_path: Path, fingerprint: str, ts: ToolStats) -> None
         pass
 
 
-def parse(*, sessions_dir: Path = SESSIONS_DIR) -> ToolStats | None:
-    """Parse Codex CLI session logs. Returns None if no data available."""
-    if not sessions_dir.exists():
+def parse(
+    *,
+    sessions_dir: Path = SESSIONS_DIR,
+    sessions_dirs: list[Path] | None = None,
+) -> ToolStats | None:
+    """Parse Codex CLI session logs. Returns None if no data available.
+
+    sessions_dirs: optional list of base dirs to read together — e.g. a remote
+    host's rsync mirror plus its .remote-<host> recall-sync staging dir, which
+    preserves sessions rotated off the remote. Sessions that appear in more than
+    one base are collapsed by session_meta.id, so the staging copy of a rotated
+    session is recovered without double-counting the mirror. When omitted, reads
+    the single sessions_dir (the local CODEX_HOME default).
+    """
+    bases = sessions_dirs if sessions_dirs is not None else [sessions_dir]
+    bases = [b for b in bases if b.exists()]
+    if not bases:
         return None
-    # rglob descends into dot-prefixed dirs, so exclude recall-sync staging
-    # mirrors (e.g. .remote-<host>/) parked under the local CODEX_HOME. Those
-    # sessions are already counted under their own host from the rsync cache;
-    # reading them here too would double-count. Mirrors the dot-dir skip the
-    # Claude parser does in _iter_project_dirs.
-    files = sorted(
-        p
-        for p in sessions_dir.rglob("*.jsonl")
-        if p.is_file()
-        and not any(part.startswith(".") for part in p.relative_to(sessions_dir).parts)
-    )
+    # rglob descends into dot-prefixed dirs, so within each base exclude
+    # recall-sync staging mirrors (.remote-<host>/) parked under a CODEX_HOME:
+    # for the local home those belong to their own host (read explicitly as a
+    # base for that host), so counting them here too would double-count. The
+    # skip is relative to each base, so passing a .remote-<host> dir as a base
+    # itself still includes its files. Mirrors the Claude parser's dot-dir skip.
+    files: list[Path] = []
+    for b in bases:
+        files.extend(
+            p
+            for p in b.rglob("*.jsonl")
+            if p.is_file()
+            and not any(part.startswith(".") for part in p.relative_to(b).parts)
+        )
+    files = sorted(files)
     if not files:
         return None
 
     # Check cache (stored in repo's .cache dir, not inside ~/.codex/)
     import hashlib
-    base_hash = hashlib.md5(str(sessions_dir).encode()).hexdigest()[:12]
+    base_hash = hashlib.md5("|".join(str(b) for b in bases).encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
     cache_path = cache_dir / f"codex-sessions-{base_hash}.json"
     fp = _dir_fingerprint(files)

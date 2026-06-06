@@ -218,9 +218,19 @@ def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[Too
                 projects_base=project_bases,
             )
         xk = None
-        codex_sessions = base / "codex" / "sessions"
-        if codex_sessions.exists():
-            xk = dict(sessions_dir=codex_sessions)
+        # Combine the rsync mirror with the .remote-<host> recall-sync staging
+        # dir (under the local CODEX_HOME), which preserves Codex sessions
+        # rotated off the remote. session_meta.id dedup at the parser level
+        # collapses the overlap. Mirrors the Claude projects_base list above.
+        codex_bases: list[Path] = []
+        codex_mirror = base / "codex" / "sessions"
+        if codex_mirror.is_dir():
+            codex_bases.append(codex_mirror)
+        codex_staging = Path.home() / ".codex" / "sessions" / f".remote-{host}"
+        if codex_staging.is_dir():
+            codex_bases.append(codex_staging)
+        if codex_bases:
+            xk = dict(sessions_dirs=codex_bases)
         gk = None
         grok_sessions = base / "grok" / "sessions"
         if grok_sessions.exists():
