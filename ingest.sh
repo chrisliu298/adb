@@ -49,16 +49,17 @@ if [ -d "$LAM" ]; then
 fi
 for h in $HOSTS; do
     addj "$CACHE/$h/claude/projects"            "$DATA/claude/$h"
-    addj "$HOME/.claude/projects/.remote-$h"    "$DATA/claude/$h"
     addj "$RECOVERY/mirror/$h/claude/projects"  "$DATA/claude/$h"
     addmeta "$DATA/claude/$h/.meta" "$CACHE/$h/claude/stats-cache.json" "$CACHE/$h/claude/history.jsonl"
 done
+# Note: the ~/.{claude,codex}/.../.remote-<host> recall-sync staging dirs (frozen
+# 2026-04-24, recall-sync removed) were folded into data/ and then deleted as
+# redundant, so they are no longer ingest sources.
 
 # ---- Codex ----
 addj "$HOME/.codex/sessions"  "$DATA/codex/local"  --exclude='.remote-*'
 for h in $HOSTS; do
     addj "$CACHE/$h/codex/sessions"         "$DATA/codex/$h"
-    addj "$HOME/.codex/sessions/.remote-$h" "$DATA/codex/$h"
 done
 
 # ---- Grok ----  (signals.json is rewritten, not append-only -> plain copy)
