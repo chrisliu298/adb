@@ -22,9 +22,13 @@ from parser.parsers.codex import (  # noqa: E402
 )
 
 
-def _rollout(path, sid, n_pad):
+def _rollout(path, sid, n_pad, tokens=None):
     rows = [{"type": "session_meta", "timestamp": "2026-06-03T00:00:00Z",
              "payload": {"id": sid, "cwd": "/x"}}]
+    if tokens is not None:
+        rows.append({"type": "event_msg", "timestamp": "2026-06-03T00:00:00Z",
+                     "payload": {"type": "token_count",
+                                 "info": {"total_token_usage": {"total_tokens": tokens}}}})
     # padding lines so files of the "same" session differ in size
     for _ in range(n_pad):
         rows.append({"type": "response_item", "timestamp": "2026-06-03T00:00:01Z",
@@ -49,6 +53,19 @@ def test_dedup_keeps_largest_per_session():
         _rollout(copy_small, "dup-1", 2)  # smaller copy, same session id
         kept = _dedup_files_by_session([original, copy_small])
     assert kept == [original], kept  # one file, the larger one
+
+
+def test_dedup_keeps_token_richest():
+    # The byte-LARGER copy has FEWER tokens; dedup must keep the token-richer one,
+    # not the byte-largest (byte size is not a token-count guarantee).
+    with tempfile.TemporaryDirectory() as d:
+        padded = Path(d) / "padded.jsonl"   # byte-larger, token-poorer
+        rich = Path(d) / "rich.jsonl"       # byte-smaller, token-richer
+        _rollout(padded, "dup-2", n_pad=200, tokens=100)
+        _rollout(rich, "dup-2", n_pad=1, tokens=9000)
+        assert padded.stat().st_size > rich.stat().st_size  # sanity
+        kept = _dedup_files_by_session([padded, rich])
+    assert kept == [rich], kept
 
 
 def test_distinct_sessions_all_kept():

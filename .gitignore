@@ -5,3 +5,6 @@ __pycache__/
 .relay/
 .cache/
 remotes.conf
+
+# append-only source-of-truth store (multi-GB session data)
+data/

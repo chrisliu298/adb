@@ -297,19 +297,40 @@ def _build_projects(agg: _Aggregates) -> list[ProjectInfo]:
     return rows[:10]
 
 
-def parse(*, sessions_dir: Path = SESSIONS_DIR) -> ToolStats | None:
-    """Parse Grok Build CLI session logs. Returns None if no data available."""
-    if not sessions_dir.exists():
+def parse(
+    *,
+    sessions_dir: Path = SESSIONS_DIR,
+    sessions_dirs: list[Path] | None = None,
+) -> ToolStats | None:
+    """Parse Grok Build CLI session logs. Returns None if no data available.
+
+    sessions_dirs: optional list of bases read together (e.g. the durable store
+    bucket plus the live home for freshness). A session is a self-contained
+    `<enc-cwd>/<uuid>` dir, so copies across bases are collapsed by that relative
+    path (first base wins) — Grok has no cross-file token replay to dedup further.
+    """
+    bases = sessions_dirs if sessions_dirs is not None else [sessions_dir]
+    bases = [b for b in bases if b.exists()]
+    if not bases:
         return None
-    dirs = _iter_session_dirs(sessions_dir)
+    seen: set[str] = set()
+    dirs: list[Path] = []
+    for b in bases:
+        for d in _iter_session_dirs(b):
+            rel = str(d.relative_to(b))
+            if rel in seen:
+                continue
+            seen.add(rel)
+            dirs.append(d)
     if not dirs:
         return None
 
     import hashlib
 
-    base_hash = hashlib.md5(str(sessions_dir).encode()).hexdigest()[:12]
+    # RESOLVED, NUL-joined bases; v2 tag bumped on accounting changes (see codex).
+    base_hash = hashlib.md5("\x00".join(str(b.resolve()) for b in bases).encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    cache_path = cache_dir / f"grok-sessions-{base_hash}.json"
+    cache_path = cache_dir / f"grok-sessions-v2-{base_hash}.json"
     fp = _dir_fingerprint(dirs)
     cached = _load_cache(cache_path)
     if cached and cached.get("fp") == fp:

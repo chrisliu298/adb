@@ -929,13 +929,18 @@ def parse(
     history_path: Path = HISTORY,
     projects_base = PROJECTS_BASE,
 ) -> ToolStats | None:
-    """Parse Claude Code stats. Returns None if no data available."""
-    if not stats_path.exists():
-        return None
-    try:
-        st = orjson.loads(stats_path.read_bytes())
-    except (orjson.JSONDecodeError, OSError):
-        return None
+    """Parse Claude Code stats. Returns None if no data available.
+
+    stats-cache.json is optional: when absent/unreadable we fall back to an empty
+    stats dict and derive everything from the session JSONL, so a missing meta file
+    can never silently drop a host's entire token total.
+    """
+    st: dict = {}
+    if stats_path.exists():
+        try:
+            st = orjson.loads(stats_path.read_bytes())
+        except (orjson.JSONDecodeError, OSError):
+            st = {}
 
     mu = st.get("modelUsage", {}) or {}
     da = st.get("dailyActivity", []) or []

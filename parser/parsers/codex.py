@@ -443,30 +443,63 @@ def _session_id_of(path: Path) -> str | None:
     return None
 
 
+def _session_max_total_tokens(path: Path) -> int:
+    """Largest cumulative total_tokens snapshot in a rollout — a completeness
+    proxy for choosing the richest copy of a duplicated session. Byte size is NOT
+    a token-count guarantee (verbose tool output inflates bytes without adding
+    token snapshots), so dedup ranks by this, not st_size."""
+    best = 0
+    try:
+        with path.open("rb") as f:
+            for line in f:
+                if b'"total_token_usage"' not in line:
+                    continue
+                try:
+                    o = orjson.loads(line)
+                except orjson.JSONDecodeError:
+                    continue
+                tt = ((o.get("payload") or {}).get("info") or {}).get("total_token_usage") or {}
+                v = tt.get("total_tokens")
+                if isinstance(v, int) and v > best:
+                    best = v
+    except OSError:
+        pass
+    return best
+
+
 def _dedup_files_by_session(files: list[Path]) -> list[Path]:
     """Collapse duplicate rollouts of the same Codex session to a single file.
 
     A session's rollout can exist in more than one place — e.g. task-synth saves
     a copy into its task dir while the original lives in the shadow CODEX_HOME.
     The parser has no cross-file token dedup, so counting both would double the
-    session's tokens. Keep the largest file per session_meta.id (the most
-    complete copy); files with no readable session id are all kept.
+    session's tokens. Keep the TOKEN-richest copy per session_meta.id — byte size
+    is not a token-count guarantee, so a byte-bigger-but-token-poorer copy must
+    not win and silently undercount. Files with no readable session id are all
+    kept. The token scan only runs for genuinely duplicated sessions.
     """
-    best: dict[str, tuple[int, Path]] = {}
+    by_sid: dict[str, list[Path]] = {}
     unkeyed: list[Path] = []
     for p in files:
         sid = _session_id_of(p)
         if not sid:
             unkeyed.append(p)
-            continue
+        else:
+            by_sid.setdefault(sid, []).append(p)
+
+    def _size(p: Path) -> int:
         try:
-            size = p.stat().st_size
+            return p.stat().st_size
         except OSError:
-            size = 0
-        cur = best.get(sid)
-        if cur is None or size > cur[0]:
-            best[sid] = (size, p)
-    return sorted(unkeyed + [p for _, p in best.values()])
+            return 0
+
+    kept: list[Path] = []
+    for ps in by_sid.values():
+        if len(ps) == 1:
+            kept.append(ps[0])
+        else:  # token-richest wins, byte size as the tie-break
+            kept.append(max(ps, key=lambda p: (_session_max_total_tokens(p), _size(p))))
+    return sorted(unkeyed + kept)
 
 
 def _dir_fingerprint(files: list[Path]) -> str:
@@ -539,12 +572,13 @@ def parse(
 
     # Check cache (stored in repo's .cache dir, not inside ~/.codex/)
     import hashlib
-    # NUL-join: cannot appear in a path, so distinct base lists never collide
-    # (a "|" delimiter could, since paths may contain "|"). A single base joins to
-    # itself, keeping the cache key identical to the old single-dir hash.
-    base_hash = hashlib.md5("\x00".join(str(b) for b in bases).encode()).hexdigest()[:12]
+    # NUL-join (cannot appear in a path, so distinct base lists never collide) of
+    # RESOLVED bases (so an aliased path can't spawn a divergent cache). The v2 tag
+    # is bumped whenever the accounting/dedup logic changes, so a stale whole-result
+    # cache written under older logic is never served (Claude does this via tokens3).
+    base_hash = hashlib.md5("\x00".join(str(b.resolve()) for b in bases).encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    cache_path = cache_dir / f"codex-sessions-{base_hash}.json"
+    cache_path = cache_dir / f"codex-sessions-v2-{base_hash}.json"
     fp = _dir_fingerprint(files)
     cached = _load_codex_cache(cache_path)
     if cached and cached.get("fp") == fp:

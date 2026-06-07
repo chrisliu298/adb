@@ -27,9 +27,11 @@ from parser.parsers import claude as claude_parser
 from parser.parsers import codex as codex_parser
 from parser.parsers import grok as grok_parser
 from parser.types import CostBreakdown, DayActivity, ProjectInfo, TokenBreakdown, ToolStats
+from parser import floor
 
 REPO_DIR = Path(__file__).resolve().parent
 REMOTE_CACHE = REPO_DIR / ".cache" / "remotes"
+DATA_DIR = REPO_DIR / "data"  # in-repo append-only source of truth (gitignored)
 REMOTES_CONF = REPO_DIR / "remotes.conf"
 
 
@@ -170,8 +172,27 @@ def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[Too
     # Build work items: (name, claude_kwargs, codex_kwargs, grok_kwargs)
     work: list[tuple[str, dict | None, dict | None, dict | None]] = []
 
-    # Local machine is always included
-    work.append(("local", {}, {}, {}))
+    # Local machine: read the in-repo durable store (data/) PLUS a live overlay so
+    # sessions written since the last ingest show immediately. The parser dedup
+    # (msg.id / session_meta.id) collapses the overlap for free; the store carries
+    # history the live homes may have lost to the silently-reverting 30-day cleanup.
+    # The live overlay (~/.claude/projects) auto-discovers the local-agent-mode
+    # container, so the store's local-agent-mode bucket is NOT listed here —
+    # listing both would double-count LAM sessions (different rel-paths defeat the
+    # dedup). The store still backs LAM up; the floor guard backstops any loss.
+    local_ck = dict(projects_base=[
+        DATA_DIR / "claude" / "local",
+        Path.home() / ".claude" / "projects",  # live overlay (freshness + LAM discovery)
+    ])
+    local_xk = dict(sessions_dirs=[
+        DATA_DIR / "codex" / "local",
+        Path.home() / ".codex" / "sessions",  # live overlay
+    ])
+    local_gk = dict(sessions_dirs=[
+        DATA_DIR / "grok" / "local",
+        Path.home() / ".grok" / "sessions",  # live overlay
+    ])
+    work.append(("local", local_ck, local_xk, local_gk))
 
     # Determine which remotes to include
     all_remotes = _load_remote_hosts()
@@ -197,44 +218,26 @@ def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[Too
                 _sync_remotes()
 
     for host in include_remotes:
-        base = REMOTE_CACHE / host
+        # Read each remote's tokens from the in-repo durable store only. The store
+        # already folds the rsync mirror + .remote-<host> staging + recovery archive
+        # into one append-only bucket per host (ingest.sh), so there is nothing to
+        # combine here and nothing the live sources can silently delete out from
+        # under the lifetime total.
         ck = None
-        claude_stats = base / "claude" / "stats-cache.json"
-        if claude_stats.exists():
-            # Combine rsync cache (fresh, refreshed by sync.sh) with the
-            # recall-sync staging dir (.remote-<host>) which preserves older
-            # sessions that have been rotated off the remote since.
-            # msg.id dedup at the parser level handles any overlap.
-            project_bases: list[Path] = []
-            rsync_projects = base / "claude" / "projects"
-            if rsync_projects.is_dir():
-                project_bases.append(rsync_projects)
-            staging = Path.home() / ".claude" / "projects" / f".remote-{host}"
-            if staging.is_dir():
-                project_bases.append(staging)
+        cdir = DATA_DIR / "claude" / host
+        if cdir.is_dir():
+            # stats-cache.json may be absent (a host whose .meta didn't sync); the
+            # parser falls back to the session JSONL, so a missing 4 KB meta file no
+            # longer silently drops the host's entire token total.
             ck = dict(
-                stats_path=claude_stats,
-                history_path=base / "claude" / "history.jsonl",
-                projects_base=project_bases,
+                stats_path=cdir / ".meta" / "stats-cache.json",
+                history_path=cdir / ".meta" / "history.jsonl",
+                projects_base=[cdir],
             )
-        xk = None
-        # Combine the rsync mirror with the .remote-<host> recall-sync staging
-        # dir (under the local CODEX_HOME), which preserves Codex sessions
-        # rotated off the remote. session_meta.id dedup at the parser level
-        # collapses the overlap. Mirrors the Claude projects_base list above.
-        codex_bases: list[Path] = []
-        codex_mirror = base / "codex" / "sessions"
-        if codex_mirror.is_dir():
-            codex_bases.append(codex_mirror)
-        codex_staging = Path.home() / ".codex" / "sessions" / f".remote-{host}"
-        if codex_staging.is_dir():
-            codex_bases.append(codex_staging)
-        if codex_bases:
-            xk = dict(sessions_dirs=codex_bases)
-        gk = None
-        grok_sessions = base / "grok" / "sessions"
-        if grok_sessions.exists():
-            gk = dict(sessions_dir=grok_sessions)
+        xdir = DATA_DIR / "codex" / host
+        xk = dict(sessions_dirs=[xdir]) if xdir.is_dir() else None
+        gdir = DATA_DIR / "grok" / host
+        gk = dict(sessions_dir=gdir) if gdir.is_dir() else None
         if ck is not None or xk is not None or gk is not None:
             work.append((host, ck, xk, gk))
 
@@ -382,11 +385,44 @@ def print_stats(
     codex: ToolStats | None,
     grok: ToolStats | None = None,
     per_machine: MachineData | None = None,
+    apply_floor: bool = False,
+    rebaseline: bool = False,
 ) -> None:
     stats_list = [s for s in (claude, codex, grok) if s is not None]
     combined = _merge_stats(stats_list)
     total_cost = combined.total_cost
     total_tokens = combined.total_tokens.total
+    # Floor guard: the lifetime per-tool token total must never decrease. Only on
+    # the full run (a subset computes less, which must not trip it). On a drop,
+    # HOLD ONLY the headline lifetime cell at the high-water — all derived math
+    # (cost/1K, daily avg, per-machine) keeps the real computed totals so ratios
+    # stay consistent; the banner explains the gap.
+    lifetime_display = total_tokens
+    if apply_floor:
+        _computed = {
+            "claude": claude.total_tokens.total if claude else 0,
+            "codex": codex.total_tokens.total if codex else 0,
+            "grok": grok.total_tokens.total if grok else 0,
+        }
+        _effective, _regressions = floor.apply(_computed, rebaseline=rebaseline)
+        lifetime_display = sum(_effective.values())
+        if _regressions:
+            if any(t == floor.UNREADABLE for t, _, _ in _regressions):
+                _msg = (
+                    "[bold]FLOOR LEDGER UNREADABLE[/bold] — the data-loss guard is DEGRADED and was not "
+                    "updated. Inspect data/.meta/adb-floor.json before trusting this number."
+                )
+            else:
+                _parts = ", ".join(
+                    f"{t} {fmt_tokens(fv)}→{fmt_tokens(cv)} (-{fmt_tokens(fv - cv)})"
+                    for t, fv, cv in _regressions
+                )
+                _msg = (
+                    f"[bold]DATA-LOSS ALERT[/bold] — lifetime total dropped: {_parts}.\n"
+                    "The header cell is held at the recorded high-water; the sections below show the "
+                    "real (lower) computed values. Investigate the store, or re-run with --rebaseline to accept it."
+                )
+            console.print(Panel(_msg, style="red", border_style="red"))
     total_sessions = combined.total_sessions
     total_messages = combined.total_messages
     total_tool_calls = combined.total_tool_calls
@@ -396,7 +432,7 @@ def print_stats(
     _all_active_days = {d.day for d in combined.daily}
     _all_active_days |= _history_active_days(HISTORY_PATH)
     for _host in _load_remote_hosts():
-        _all_active_days |= _history_active_days(REMOTE_CACHE / _host / "claude" / "history.jsonl")
+        _all_active_days |= _history_active_days(DATA_DIR / "claude" / _host / ".meta" / "history.jsonl")
     days_active = len(_all_active_days)
     streak = compute_streak(claude, codex, grok)
     daily_by_date = {d.day: d for d in combined.daily}
@@ -570,7 +606,7 @@ def print_stats(
     ribbon = Text()
     ribbon.append(f"{total_sessions:,} sess", style="grey62")
     ribbon.append(sep, style="grey37")
-    ribbon.append(f"{fmt_tokens(total_tokens)} tok", style="grey62")
+    ribbon.append(f"{fmt_tokens(lifetime_display)} tok", style="grey62")
     ribbon.append(sep, style="grey37")
     ribbon.append(f"{days_active}d", style="grey62")
     ribbon.append(sep, style="grey37")
@@ -907,6 +943,10 @@ def main() -> None:
         "--sync", action="store_true",
         help=f"force a remote sync (otherwise auto-runs only when cache > {STALE_HOURS}h old)",
     )
+    ap.add_argument(
+        "--rebaseline", action="store_true",
+        help="accept the current (possibly lower) totals as the new lifetime floor",
+    )
     args = ap.parse_args()
 
     claude, codex, grok, per_machine = load_all(args.machines, sync=args.sync)
@@ -914,7 +954,18 @@ def main() -> None:
     if not stats_list:
         print("No usage data found.")
         sys.exit(1)
-    print_stats(claude, codex, grok, per_machine)
+    # The floor (lifetime high-water) applies to the FULL scope — local + every
+    # remote — however requested (["all"], or local + all hosts named explicitly).
+    _remotes = set(_load_remote_hosts())
+    if args.machines == ["all"]:
+        is_full = True
+    elif args.machines == ["local"]:
+        is_full = not _remotes
+    else:
+        is_full = _remotes.issubset(set(args.machines))
+    if args.rebaseline and not is_full:
+        console.print("[yellow]--rebaseline ignored: it applies only to the full all-machines run.[/yellow]")
+    print_stats(claude, codex, grok, per_machine, apply_floor=is_full, rebaseline=args.rebaseline and is_full)
 
 
 if __name__ == "__main__":
