@@ -713,6 +713,52 @@ def print_stats(
             border_style=BORDER, box=box.ROUNDED, padding=(0, 1), width=width, **kwargs,
         )
 
+    def _trunc(s: str, n: int) -> str:
+        """Truncate to n chars with a trailing ellipsis, so a clipped name reads as
+        clipped (vs a hard slice that looks like a real, shorter name)."""
+        return s if len(s) <= n else s[: n - 1] + "…"
+
+    def _panel(content, title):
+        """A section panel WITHOUT a fixed width — sizes to its container cell, for
+        use inside a paired 2-column row (vs _section which spans the full width)."""
+        tc = SECTION_COLORS.get(title, "bold")
+        return Panel(
+            content, title=f"[{tc}]{title}[/{tc}]", title_align="left",
+            border_style=BORDER, box=box.ROUNDED, padding=(0, 1),
+        )
+
+    def _body_rows(content) -> int:
+        """Rendered line count of a panel body: a Table contributes its row_count,
+        any other renderable (Text, sparkline, footnote) one line, a Group the sum.
+        Used to balance two paired panels to equal height regardless of gated rows."""
+        if isinstance(content, Group):
+            return sum(_body_rows(r) for r in content.renderables)
+        if isinstance(content, Table):
+            return content.row_count
+        return 1
+
+    PAIR_MIN_WIDTH = 92  # below this, paired panels truncate — stack them full-width
+
+    def _pair(left_content, left_title, right_content, right_title, ratio=(1, 1)):
+        """Render two sections side-by-side, padded to equal height. Below
+        PAIR_MIN_WIDTH the cells get too narrow (values truncate), so stack
+        full-width instead. Height is balanced by padding the shorter body with
+        blank lines computed from the ACTUAL row counts, so it survives the gated
+        rows that vary the two panels' heights run-to-run."""
+        if width < PAIR_MIN_WIDTH:
+            console.print(_section(left_content, left_title))
+            console.print(_section(right_content, right_title))
+            return
+        lr, rr = _body_rows(left_content), _body_rows(right_content)
+        target = max(lr, rr)
+        lc = Group(left_content, *(Text("") for _ in range(target - lr))) if lr < target else left_content
+        rc = Group(right_content, *(Text("") for _ in range(target - rr))) if rr < target else right_content
+        row = Table(box=None, show_header=False, show_edge=False, padding=0, width=width)
+        row.add_column("left", ratio=ratio[0])
+        row.add_column("right", ratio=ratio[1])
+        row.add_row(_panel(lc, left_title), _panel(rc, right_title))
+        console.print(row)
+
     def _styled_delta(cur: float, prev: float) -> str:
         if prev <= 0:
             return ""
@@ -937,17 +983,12 @@ def print_stats(
     if reasoning_toks > 0 and total_output_tokens > 0:
         r_pct = reasoning_toks / total_output_tokens * 100
         cost_summary.add_row("Reasoning", f"{fmt_tokens(reasoning_toks)} \u00b7 {r_pct:.0f}% of output [grey50](Codex)[/grey50]")
-    _cost_tc = SECTION_COLORS.get("Cost", "bold")
-    cost_panel = Panel(
-        Group(cost_bar_table, Text(""), cost_summary),
-        title=f"[{_cost_tc}]Cost[/{_cost_tc}]", title_align="left",
-        border_style=BORDER, box=box.ROUNDED, padding=(0, 1),
-    )
+    cost_body = Group(cost_bar_table, Text(""), cost_summary)
 
     # --- 4. MODELS ---
     if merged_models:
         models_table = Table(box=box.HORIZONTALS, border_style=BORDER, show_edge=False, padding=(0, 1), expand=True)
-        models_table.add_column("Model", style="bold", no_wrap=True, ratio=1)
+        models_table.add_column("Model", style="bold", no_wrap=True, ratio=1, min_width=18)
         models_table.add_column("Total", justify="right", no_wrap=True, min_width=6)
         models_table.add_column("Input", justify="right", no_wrap=True, min_width=6)
         models_table.add_column("Output", justify="right", no_wrap=True, min_width=6)
@@ -1087,7 +1128,11 @@ def print_stats(
     if combined.stop_reasons:
         sr_total = sum(combined.stop_reasons.values())
         sr_sorted = sorted(combined.stop_reasons.items(), key=lambda kv: kv[1], reverse=True)
-        sr_parts = [f"{r} {c / sr_total * 100:.0f}%" for r, c in sr_sorted[:3]]
+        # Abbreviate the long stop-reason labels so the row fits the half-width
+        # Activity panel instead of truncating mid-word ("stop_s…").
+        _SR_ABBR = {"tool_use": "tool", "end_turn": "end", "stop_sequence": "seq",
+                    "max_tokens": "max", "pause_turn": "pause", "refusal": "refuse"}
+        sr_parts = [f"{_SR_ABBR.get(r, r)} {c / sr_total * 100:.0f}%" for r, c in sr_sorted[:3]]
         act.add_row("Stops", " · ".join(sr_parts))
 
     # Sparkline for last 14 days
@@ -1132,18 +1177,8 @@ def print_stats(
             spark_rl.append(f" peak {max(rl_vals):.0f}%")
             act.add_row("RL 5h", spark_rl)
 
-    _act_tc = SECTION_COLORS.get("Activity", "bold")
-    activity_panel = Panel(
-        act, title=f"[{_act_tc}]Activity[/{_act_tc}]", title_align="left",
-        border_style=BORDER, box=box.ROUNDED, padding=(0, 1),
-    )
-
-    # --- Cost + Activity side by side ---
-    side_by_side = Table(box=None, show_header=False, show_edge=False, padding=0, width=width)
-    side_by_side.add_column("left", ratio=1)
-    side_by_side.add_column("right", ratio=1)
-    side_by_side.add_row(cost_panel, activity_panel)
-    console.print(side_by_side)
+    # --- Cost + Activity side by side, height-balanced (stacks below PAIR_MIN_WIDTH) ---
+    _pair(cost_body, "Cost", act, "Activity")
 
     # --- 4b. AGENTS (per-CLI comparison) ---
     # Each tool's own ToolStats is still separate before the combined merge, so a
@@ -1177,12 +1212,12 @@ def print_stats(
             )
         console.print(_section(agents_table, "Agents"))
 
-    # --- 5. TOOLS ---
-    # Per-tool-name call counts (Claude + Codex; Grok records only per-session
-    # tool presence, not call counts, so it is excluded to keep the metric a true
-    # call-count breakdown). Denominator is the sum of these counts, not
-    # total_tool_calls (which includes Grok), so the percentages are internally
-    # consistent.
+    # --- 5. TOOLS + HEATMAP, paired side-by-side (Tools wider; stacks when narrow) ---
+    # Per-tool-name call counts (Claude + Codex; Grok records only per-session tool
+    # presence, not call counts, so it is excluded to keep this a true call-count
+    # breakdown). Denominator is the sum of these counts, not total_tool_calls
+    # (which includes Grok), so the percentages are internally consistent.
+    tools_body = None
     if combined.tool_calls_by_name:
         tools_sorted = sorted(combined.tool_calls_by_name.items(), key=lambda kv: (-kv[1], kv[0]))
         tool_total = sum(c for _, c in tools_sorted)
@@ -1191,48 +1226,80 @@ def print_stats(
         other = sum(c for _, c in tools_sorted[TOP_N:])
         if other > 0:
             rows = rows + [("other", other)]
-        TBAR = 16
-        tools_table = Table(box=None, show_header=False, show_edge=False, padding=(0, 1, 0, 0), expand=True)
+        # The bar is the panel's primary signal — a fixed 16-cell bar under-resolved
+        # the distribution (everything > 6% maxed out) AND left dead space. Size it to
+        # FILL the panel: budget = inner width − name − count − pct − pads. The panel
+        # is the ratio-3 half of the 3:2 pair (or full width when stacked < PAIR_MIN),
+        # estimated from `width`; a 1-col safety margin keeps it from overflowing if
+        # rich's ratio rounding differs. Name truncates to 18 to bound the worst case.
+        names = [_trunc(n, 18) for n, _ in rows]
+        counts = [f"{c:,}" for _, c in rows]
+        name_w = max((len(n) for n in names), default=4)
+        count_w = max((len(c) for c in counts), default=1)
+        tools_inner = (round(width * 3 / 5) if width >= PAIR_MIN_WIDTH else width) - 4
+        TBAR = max(10, tools_inner - name_w - count_w - 6 - 4)  # 6=pct ("100.0%"), 4=pads+safety
+        tools_table = Table(box=None, show_header=False, show_edge=False, padding=(0, 1, 0, 0), expand=False)
         tools_table.add_column("tool", style="bold", no_wrap=True)
         tools_table.add_column("count", justify="right", no_wrap=True)
         tools_table.add_column("bar", no_wrap=True)
         tools_table.add_column("pct", justify="right", style="dim", no_wrap=True)
-        for name, cnt in rows:
+        for (name, cnt), disp_name in zip(rows, names):
             pct = cnt / tool_total if tool_total else 0
             filled = int(pct * TBAR)
             bar = f"[#d7afd7]{'█' * filled}[/#d7afd7][bright_black]{'░' * (TBAR - filled)}[/bright_black]"
-            tools_table.add_row(name[:22], f"{cnt:,}", Text.from_markup(bar), fmt_pct(cnt, tool_total))
-        footnote = Text("Claude + Codex tool calls · % = share of named tool calls", style="dim")
-        console.print(_section(Group(tools_table, footnote), "Tools"))
+            tools_table.add_row(disp_name, f"{cnt:,}", Text.from_markup(bar), fmt_pct(cnt, tool_total))
+        footnote = Text("Claude+Codex calls · % of named", style="dim")
+        tools_body = Group(tools_table, footnote)
 
-    # --- 5c. HEATMAP (weekday × hour message activity, local time) ---
+    # Weekday × hour message activity, local time.
+    heat_body = None
     if any(combined.heatmap):
         DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         hmax = max(combined.heatmap) or 1
-        heat_tbl = Table(box=None, show_header=False, show_edge=False, padding=(0, 1, 0, 0), expand=False)
-        heat_tbl.add_column("d", style="bold", no_wrap=True)
-        heat_tbl.add_column("cells", no_wrap=True)
-        ruler = Text()
-        for h in range(24):
-            ruler.append("┊" if h % 6 == 0 else " ", style="grey42")
-        heat_tbl.add_row(Text(""), ruler)
         # Shade ramp gives contrast even where color is unavailable; the gradient
         # color reinforces it where it is.
         HEAT_CHARS = " ░░▒▒▓▓█"
-        for wd in range(7):
-            cells = Text()
-            for h in range(24):
-                v = combined.heatmap[wd * 24 + h]
+
+        def _heat_cells(values, vmax) -> Text:
+            # sqrt scale: a peaked distribution otherwise flattens every non-peak
+            # cell to the lightest shade, hiding the focus windows.
+            t = Text()
+            for v in values:
                 if v <= 0:
-                    cells.append("·", style="grey23")
+                    t.append("·", style="grey23")
                 else:
-                    # sqrt scale: a peaked distribution otherwise flattens every
-                    # non-peak hour to the lightest shade, hiding the focus windows.
-                    idx = min(7, max(1, int((v / hmax) ** 0.5 * 7)))
-                    cells.append(HEAT_CHARS[idx], style=SPARK_GRADIENT[idx])
-            heat_tbl.add_row(DOW[wd], cells)
-        heat_foot = Text("┊ = 0/6/12/18h local · brighter = busier", style="dim")
-        console.print(_section(Group(heat_tbl, heat_foot), "Heatmap"))
+                    idx = min(7, max(1, int((v / vmax) ** 0.5 * 7)))
+                    t.append(HEAT_CHARS[idx], style=SPARK_GRADIENT[idx])
+            return t
+
+        heat_tbl = Table(box=None, show_header=False, show_edge=False, padding=(0, 1, 0, 0), expand=False)
+        heat_tbl.add_column("d", style="bold", no_wrap=True)
+        heat_tbl.add_column("cells", no_wrap=True)
+        heat_tbl.add_column("tot", justify="right", style="dim", no_wrap=True)  # per-row magnitude
+        ruler = Text()
+        for h in range(24):
+            ruler.append("┊" if h % 6 == 0 else " ", style="grey42")
+        heat_tbl.add_row(Text(""), ruler, Text(""))
+        for wd in range(7):
+            day = combined.heatmap[wd * 24:wd * 24 + 24]
+            heat_tbl.add_row(DOW[wd], _heat_cells(day, hmax), fmt_tokens(sum(day)))
+        # Σ row: the hour-of-day marginal (column sums of the grid above), on its own
+        # scale so the 7×-larger totals don't saturate. Adds the "which hours overall"
+        # read the per-day grid can't give, and lifts the body to match Tools' height
+        # so the pairing helper's blank padding line disappears.
+        hour_marg = [sum(combined.heatmap[wd * 24 + h] for wd in range(7)) for h in range(24)]
+        heat_tbl.add_row(Text("Σ", style="bold"), _heat_cells(hour_marg, max(hour_marg) or 1), fmt_tokens(sum(hour_marg)))
+        heat_foot = Text("┊ 0/6/12/18h · brighter→busier", style="dim")
+        heat_body = Group(heat_tbl, heat_foot)
+
+    # Tools needs the width (long names + bars); the heatmap is a fixed 24-col grid,
+    # so a 3:2 split fits both. If only one has data, render it full-width.
+    if tools_body is not None and heat_body is not None:
+        _pair(tools_body, "Tools", heat_body, "Heatmap", ratio=(3, 2))
+    elif tools_body is not None:
+        console.print(_section(tools_body, "Tools"))
+    elif heat_body is not None:
+        console.print(_section(heat_body, "Heatmap"))
 
     # --- 6. MACHINES ---
     if per_machine and len(per_machine) > 1:
@@ -1270,7 +1337,7 @@ def print_stats(
         proj_table.add_column("Duration", justify="right", no_wrap=True)
         proj_table.add_column("$/Hour", justify="right", no_wrap=True)
         for p in sorted_projects:
-            name = p.path[:30]
+            name = _trunc(p.path, 30)
             dur = fmt_duration(p.duration_ms) if p.duration_ms > 0 else "—"
             cph = fmt_cost_styled(p.cost / (p.duration_ms / 3_600_000)) if p.duration_ms > 0 else "—"
             proj_table.add_row(name, Text.from_markup(fmt_cost_styled(p.cost)), fmt_tokens(p.output_tokens), dur, Text.from_markup(cph) if p.duration_ms > 0 else cph)
