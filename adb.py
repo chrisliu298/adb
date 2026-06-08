@@ -11,6 +11,7 @@ from copy import copy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 from rich import box
 from rich.align import Align
@@ -327,6 +328,11 @@ def fmt_pct(num: float, denom: float) -> str:
     return f"{num / denom * 100:.1f}%"
 
 
+def _fmt_weighted(num: float, den: float) -> str:
+    """Token-weighted $/MTok average, or '—' when there is nothing to weigh."""
+    return f"${num / den:.2f}" if den else "—"
+
+
 def short_project_name(path: str) -> str:
     """Extract repo/directory name from a full path or git URL."""
     # git@github.com:user/repo.git -> repo
@@ -336,6 +342,105 @@ def short_project_name(path: str) -> str:
     # ~/Developer/GitHub/repo -> repo
     parts = path.rstrip("/").split("/")
     return parts[-1] if parts else path
+
+
+def _model_family(name: str) -> str:
+    """Map a raw model name to a display family.
+
+    Claude models keep their tier split (Opus/Sonnet/Haiku) under a "Claude"
+    prefix; GPT and Grok each get their own section; everything else (including
+    non-Anthropic models routed through Claude Code) folds into a single "Others"
+    section. Matching is anchored to the vendor prefix so a stray tier substring
+    in another vendor's id can't mis-family it, and the GPT label carries the
+    major version derived from the name so a future GPT-6 isn't called "GPT-5".
+    """
+    n = name.lower()
+    if n.startswith("claude"):
+        if "opus" in n:   return "Claude Opus"
+        if "sonnet" in n: return "Claude Sonnet"
+        if "haiku" in n:  return "Claude Haiku"
+        return "Claude"  # other/future Claude models
+    if n.startswith("gpt"):
+        m = re.match(r"gpt-?(\d+)", n)
+        return f"GPT-{m.group(1)}" if m else "GPT"
+    if n.startswith("grok"):
+        return "Grok"
+    return "Others"
+
+
+def _model_prices(name: str) -> tuple[float | None, float | None]:
+    """List input/output price ($/MTok) for a model, or (None, None) if unpriced.
+
+    Tries Grok -> Claude -> Codex pricing; the raw model names are disjoint
+    across the three, so the lookup order only decides who answers first.
+    """
+    gp = grok_parser._pricing_for(name)
+    if gp:
+        return gp.input_usd_per_mtok, gp.output_usd_per_mtok
+    pk = claude_parser._pkey(name)
+    if pk and pk in claude_parser.PRICE:
+        p = claude_parser.PRICE[pk]
+        return p[0], p[1]
+    cp = codex_parser._pricing_for(name)
+    if cp:
+        return cp.input_usd_per_mtok, cp.output_usd_per_mtok
+    return None, None
+
+
+class _Member(NamedTuple):
+    name: str
+    tb: TokenBreakdown
+    cost: float
+    in_p: float | None
+    out_p: float | None
+
+
+class _Family(NamedTuple):
+    name: str
+    tb: TokenBreakdown   # summed token breakdown across members
+    cost: float          # summed cost across members
+    in_num: float        # Σ in_price * (input + cache_read + cache_write)
+    in_den: float        # Σ (input + cache_read + cache_write) over priced members
+    out_num: float       # Σ out_price * output
+    out_den: float       # Σ output over priced members
+    members: list[_Member]
+
+
+def _family_summaries(merged_models: dict[str, tuple[TokenBreakdown, float]]) -> list[_Family]:
+    """Group merged models into families with rollup tokens/cost/weighted price.
+
+    Pure (no rendering). Families sort by cost desc, then by total tokens, then
+    name — a total order, so the output is reproducible even when costs tie
+    (e.g. all-unpriced/zero-cost families). Members within a family sort the same
+    way. The per-family weighted In/Out $/M numerators/denominators sum to the
+    grand totals, so the family rollups stay consistent with the Total row.
+    """
+    groups: dict[str, list[tuple[str, TokenBreakdown, float]]] = {}
+    for m, (tb, cost) in merged_models.items():
+        groups.setdefault(_model_family(m), []).append((m, tb, cost))
+    families: list[_Family] = []
+    for fam, items in groups.items():
+        items.sort(key=lambda x: (-x[2], -x[1].total, x[0].lower()))
+        f_tb = TokenBreakdown()
+        in_num = in_den = out_num = out_den = 0.0
+        members: list[_Member] = []
+        for m, tb, cost in items:
+            in_p, out_p = _model_prices(m)
+            if in_p is not None:
+                in_toks = tb.input_tokens + tb.cache_read_tokens + tb.cache_write_tokens
+                in_num += in_p * in_toks
+                in_den += in_toks
+            if out_p is not None:
+                out_num += out_p * tb.output_tokens
+                out_den += tb.output_tokens
+            f_tb.add(tb)
+            members.append(_Member(m, tb, cost, in_p, out_p))
+        families.append(_Family(
+            fam, f_tb, sum(c for _, _, c in items),
+            in_num, in_den, out_num, out_den, members,
+        ))
+    families.sort(key=lambda f: (-f.cost, -f.tb.total, f.name.lower()))
+    return families
 
 
 def _history_active_days(history_path: Path) -> set[date]:
@@ -778,7 +883,7 @@ def print_stats(
 
     # --- 4. MODELS ---
     if merged_models:
-        models_table = Table(box=box.SIMPLE_HEAD, show_edge=False, padding=(0, 1), expand=True)
+        models_table = Table(box=box.HORIZONTALS, border_style=BORDER, show_edge=False, padding=(0, 1), expand=True)
         models_table.add_column("Model", style="bold", no_wrap=True, ratio=1)
         models_table.add_column("Total", justify="right", no_wrap=True, min_width=6)
         models_table.add_column("Input", justify="right", no_wrap=True, min_width=6)
@@ -789,50 +894,60 @@ def print_stats(
         models_table.add_column("Out $/M", justify="right", no_wrap=True, min_width=7)
         models_table.add_column("%", justify="right", style="dim", no_wrap=True, min_width=5)
 
-        def _model_prices(name: str) -> tuple[float | None, float | None]:
-            gp = grok_parser._pricing_for(name)
-            if gp:
-                return gp.input_usd_per_mtok, gp.output_usd_per_mtok
-            pk = claude_parser._pkey(name)
-            if pk and pk in claude_parser.PRICE:
-                p = claude_parser.PRICE[pk]
-                return p[0], p[1]
-            cp = codex_parser._pricing_for(name)
-            if cp:
-                return cp.input_usd_per_mtok, cp.output_usd_per_mtok
-            return None, None
-
+        # Family rollups (grouping + weighted-price math) are computed by the
+        # pure _family_summaries helper; this loop only renders. The grand
+        # weighted In/Out $/M sum the per-family numerators/denominators, so the
+        # Total row stays consistent with the rollups above it.
+        families = _family_summaries(merged_models)
         w_in_num = w_in_den = w_out_num = w_out_den = 0.0
-        for rank, (m, (tb, cost)) in enumerate(sorted(
-            merged_models.items(), key=lambda x: x[1][1], reverse=True
-        )):
-            cache = tb.cache_read_tokens + tb.cache_write_tokens
-            pct = fmt_pct(cost, total_cost)
-            row_style = "dim" if rank >= 3 else None
-            in_p, out_p = _model_prices(m)
-            in_str = f"${in_p:.2f}" if in_p is not None else "\u2014"
-            out_str = f"${out_p:.2f}" if out_p is not None else "\u2014"
-            if in_p is not None:
-                in_toks = tb.input_tokens + tb.cache_read_tokens + tb.cache_write_tokens
-                w_in_num += in_p * in_toks
-                w_in_den += in_toks
-            if out_p is not None:
-                w_out_num += out_p * tb.output_tokens
-                w_out_den += tb.output_tokens
-            models_table.add_row(m, fmt_tokens(tb.total), fmt_tokens(tb.input_tokens), fmt_tokens(tb.output_tokens), fmt_tokens(cache), Text.from_markup(fmt_cost_styled(cost)), in_str, out_str, pct, style=row_style)
+        for fi, fam in enumerate(families):
+            if fi > 0:
+                models_table.add_section()
+            w_in_num += fam.in_num
+            w_in_den += fam.in_den
+            w_out_num += fam.out_num
+            w_out_den += fam.out_den
+            f_cache = fam.tb.cache_read_tokens + fam.tb.cache_write_tokens
+            # Single-member families collapse to one row but keep the exact
+            # version visible (dimmed) so a lone "Others"/"Claude Haiku" stays
+            # identifiable. Built as Text so a stray '[' in a model id can't be
+            # read as rich markup.
+            if len(fam.members) == 1:
+                label = Text(fam.name)
+                label.append(f"  {fam.members[0].name}", style="dim")
+            else:
+                label = fam.name
+            models_table.add_row(
+                label, fmt_tokens(fam.tb.total), fmt_tokens(fam.tb.input_tokens),
+                fmt_tokens(fam.tb.output_tokens), fmt_tokens(f_cache),
+                Text.from_markup(fmt_cost_styled(fam.cost)),
+                _fmt_weighted(fam.in_num, fam.in_den),
+                _fmt_weighted(fam.out_num, fam.out_den),
+                fmt_pct(fam.cost, total_cost), style="bold",
+            )
+            if len(fam.members) > 1:
+                for mem in fam.members:
+                    cache = mem.tb.cache_read_tokens + mem.tb.cache_write_tokens
+                    in_str = f"${mem.in_p:.2f}" if mem.in_p is not None else "\u2014"
+                    out_str = f"${mem.out_p:.2f}" if mem.out_p is not None else "\u2014"
+                    models_table.add_row(
+                        Text(f"  {mem.name}"), fmt_tokens(mem.tb.total),
+                        fmt_tokens(mem.tb.input_tokens), fmt_tokens(mem.tb.output_tokens),
+                        fmt_tokens(cache), Text.from_markup(fmt_cost_styled(mem.cost)),
+                        in_str, out_str, fmt_pct(mem.cost, total_cost), style="dim",
+                    )
         t_total = sum(tb.total for tb, _ in merged_models.values())
         t_in = sum(tb.input_tokens for tb, _ in merged_models.values())
         t_out = sum(tb.output_tokens for tb, _ in merged_models.values())
         t_cache = sum(tb.cache_read_tokens + tb.cache_write_tokens for tb, _ in merged_models.values())
         t_cost_sum = sum(c for _, c in merged_models.values())
         models_table.add_section()
-        w_in_avg = f"${w_in_num / w_in_den:.2f}" if w_in_den else "\u2014"
-        w_out_avg = f"${w_out_num / w_out_den:.2f}" if w_out_den else "\u2014"
-        models_table.add_row("[bold]Total[/bold]", fmt_tokens(t_total), fmt_tokens(t_in), fmt_tokens(t_out), fmt_tokens(t_cache), Text.from_markup(fmt_cost_styled(t_cost_sum)), w_in_avg, w_out_avg, "", style="bold")
+        models_table.add_row("[bold]Total[/bold]", fmt_tokens(t_total), fmt_tokens(t_in), fmt_tokens(t_out), fmt_tokens(t_cache), Text.from_markup(fmt_cost_styled(t_cost_sum)), _fmt_weighted(w_in_num, w_in_den), _fmt_weighted(w_out_num, w_out_den), "", style="bold")
         if combined.unpriced_models:
             names = ", ".join(sorted(combined.unpriced_models))
             models_table.add_row(Text(f"Unpriced: {names} ({fmt_tokens(combined.unpriced_tokens)})", style="yellow"), "", "", "", "", "", "", "", "")
-        console.print(_section(models_table, "Models"))
+        footnote = Text("In/Out $/M = token-weighted list price (family rows blend versions) \u00b7 % = share of total cost", style="dim")
+        console.print(_section(Group(models_table, Text(""), footnote), "Models"))
 
     # --- 3. ACTIVITY ---
     SPARK_BLOCKS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
