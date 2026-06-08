@@ -168,7 +168,7 @@ def _load_machine(
 
 
 SYNC_SCRIPT = REPO_DIR / "sync.sh"
-STALE_HOURS = 6
+STALE_HOURS = 1
 
 
 def _sync_remotes() -> None:
