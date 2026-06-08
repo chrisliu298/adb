@@ -9,3 +9,7 @@ remotes.conf
 
 # append-only source-of-truth store (multi-GB session data)
 data/
+
+# local standalone trend-plot script + its generated output (not committed)
+plot.py
+adb-trend.html
