@@ -109,6 +109,23 @@ def _cw_cost(cw_total: int, cw_1h: int, cw_5m_price: float, cw_1h_price: float) 
     return (cw_5m * cw_5m_price + cw_1h * cw_1h_price) / 1e6
 
 
+def _msg_cost(model: str, u: dict) -> float:
+    """Priced cost of one assistant message from its usage dict. Shared by the
+    per-session rollup and the per-day daily build so both agree. 0 if unpriced."""
+    pk = _pkey(model)
+    if not pk or pk not in PRICE:
+        return 0.0
+    p = PRICE[pk]
+    cr_price, cw_5m_price, cw_1h_price = _cache_rates(pk, p[0])
+    inp = u.get("input_tokens", 0)
+    out = u.get("output_tokens", 0)
+    cr = u.get("cache_read_input_tokens", 0)
+    cw_total, cw_1h = _cw_split(u)
+    return (inp * p[0] + out * p[1] + cr * cr_price) / 1e6 + _cw_cost(
+        cw_total, cw_1h, cw_5m_price, cw_1h_price
+    )
+
+
 def _freset(s: str) -> str:
     try:
         secs = (
@@ -366,16 +383,8 @@ def _parse_one_session_file(
         pk = _pkey(model)
         if not pk or pk not in PRICE:
             continue
-        p = PRICE[pk]
-        cr_price, cw_5m_price, cw_1h_price = _cache_rates(pk, p[0])
-        inp = u.get("input_tokens", 0)
-        out = u.get("output_tokens", 0)
-        cr = u.get("cache_read_input_tokens", 0)
-        cw_total, cw_1h = _cw_split(u)
-        cost += (inp * p[0] + out * p[1] + cr * cr_price) / 1e6 + _cw_cost(
-            cw_total, cw_1h, cw_5m_price, cw_1h_price
-        )
-        output_tokens += out
+        cost += _msg_cost(model, u)
+        output_tokens += u.get("output_tokens", 0)
 
     duration_ms = 0
     if len(timestamps) >= 2:
@@ -771,7 +780,10 @@ def _parse_session_events(
     """Parse one JSONL file into per-message events for daily aggregation.
 
     Returns a list of
-    [day_str, role, mid, tool_count, output_tokens, tool_names, wh, model, stop_reason].
+    [day_str, role, mid, tool_count, output_tokens, tool_names, wh, model, stop_reason, cost].
+    - cost is the assistant message's priced USD cost (0 for user events and
+      unpriced models), summed per day so the daily total reconciles with the
+      per-session/per-model cost computed from the same usage figures.
     - role is "u" for user turns, "a" for assistant turns.
     - tool_names is the list of tool_use block names on that assistant message
       (empty for user events); the aggregator counts them per-name once the
@@ -818,7 +830,7 @@ def _parse_session_events(
                     continue
                 role = msg.get("role")
                 if role == "user":
-                    user_events.append([day_str, "u", "", 0, 0, [], wh, "", ""])
+                    user_events.append([day_str, "u", "", 0, 0, [], wh, "", "", 0.0])
                 elif role == "assistant":
                     mid = msg.get("id", "") or ""
                     if not mid:
@@ -839,22 +851,23 @@ def _parse_session_events(
                     sr = msg.get("stop_reason") or ""
                     terminal = sr in _TERMINAL_STOP_REASONS
                     model = msg.get("model", "") or ""
+                    mcost = _msg_cost(model, usage)
                     cur = asst_by_mid.get(mid)
                     if cur is None:
-                        asst_by_mid[mid] = (day_str, tool_count, otoks, terminal, tool_names, wh, model, sr)
+                        asst_by_mid[mid] = (day_str, tool_count, otoks, terminal, tool_names, wh, model, sr, mcost)
                     else:
                         cur_otoks, cur_terminal = cur[2], cur[3]
                         if (terminal and not cur_terminal) or (
                             terminal == cur_terminal and otoks > cur_otoks
                         ):
-                            asst_by_mid[mid] = (day_str, tool_count, otoks, terminal, tool_names, wh, model, sr)
+                            asst_by_mid[mid] = (day_str, tool_count, otoks, terminal, tool_names, wh, model, sr, mcost)
     except OSError:
         pass
 
     events = list(user_events)
     for mid, v in asst_by_mid.items():
-        day_str, tool_count, otoks, _term, tool_names, wh, model, sr = v
-        events.append([day_str, "a", mid, tool_count, otoks, tool_names, wh, model, sr])
+        day_str, tool_count, otoks, _term, tool_names, wh, model, sr, mcost = v
+        events.append([day_str, "a", mid, tool_count, otoks, tool_names, wh, model, sr, mcost])
     return events
 
 
@@ -875,13 +888,13 @@ def _build_daily_from_sessions(
     dirs_str = ":".join(sorted(str(d) for d in projects_dirs))
     dirs_hash = hashlib.md5(dirs_str.encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    # v5: events carry tool_use names [5], weekday×hour [6], model [7], stop_reason
-    # [8]; v4 stored only 6-element events without the heatmap/model/stop_reason.
-    cache_path = cache_dir / f"claude-daily5-{dirs_hash}.json"
+    # v6: events also carry per-message cost [9] for the per-day cost total; v5
+    # carried tool_use names [5], weekday×hour [6], model [7], stop_reason [8].
+    cache_path = cache_dir / f"claude-daily6-{dirs_hash}.json"
     cache = _load_cache(cache_path)
     cache_dirty = False
 
-    agg: dict[str, list[int]] = {}  # date → [msgs, sessions, tools, otoks]
+    agg: dict[str, list] = {}  # date → [msgs, sessions, tools, otoks, cost]
     tool_by_name: dict[str, int] = {}
     heatmap = [0] * 168            # weekday*24 + hour message counts (local time)
     stop_reasons: dict[str, int] = {}
@@ -927,7 +940,7 @@ def _build_daily_from_sessions(
                     tool_count, otoks = ev[3], ev[4]
                     file_days.add(day_str)
                     if day_str not in agg:
-                        agg[day_str] = [0, 0, 0, 0]
+                        agg[day_str] = [0, 0, 0, 0, 0.0]
                     wh = ev[6] if len(ev) > 6 else None
                     if role == "u":
                         agg[day_str][0] += 1
@@ -941,6 +954,7 @@ def _build_daily_from_sessions(
                         agg[day_str][0] += 1
                         agg[day_str][2] += tool_count
                         agg[day_str][3] += otoks
+                        agg[day_str][4] += ev[9] if len(ev) > 9 else 0.0
                         for _name in (ev[5] if len(ev) > 5 else ()):
                             tool_by_name[_name] = tool_by_name.get(_name, 0) + 1
                         if isinstance(wh, int) and 0 <= wh < 168:
@@ -958,7 +972,7 @@ def _build_daily_from_sessions(
                 if file_days:
                     first_day = min(file_days)
                     if first_day not in agg:
-                        agg[first_day] = [0, 0, 0, 0]
+                        agg[first_day] = [0, 0, 0, 0, 0.0]
                     agg[first_day][1] += 1
 
     if cache_dirty:
@@ -977,6 +991,7 @@ def _build_daily_from_sessions(
                 sessions=v[1],
                 tool_calls=v[2],
                 output_tokens=v[3],
+                cost=v[4],
             )
         )
     aux = {

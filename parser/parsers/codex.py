@@ -351,7 +351,9 @@ def _parse_session_file(
         agg.tokens_by_model.setdefault(m, _TokenUsage()).add(delta)
         d = _local_day(dt)
         agg.tokens_by_day.setdefault(d, _TokenUsage()).add(delta)
-        agg.daily.setdefault(d, DayActivity(day=d)).output_tokens += delta.output_tokens
+        da = agg.daily.setdefault(d, DayActivity(day=d))
+        da.output_tokens += delta.output_tokens
+        da.cost += sum(_usage_cost_parts(m, delta))
         agg.totals.add(delta)
 
     cwd = meta.get("cwd")
@@ -408,6 +410,26 @@ def _pricing_for(model: str) -> ModelPricing | None:
         if base.startswith(key + "-") and (best_key is None or len(key) > len(best_key)):
             best_key = key
     return MODEL_PRICING[best_key] if best_key else None
+
+
+def _usage_cost_parts(model: str, usage: _TokenUsage) -> tuple[float, float, float]:
+    """(input, cache_read, output) USD cost for a usage/delta. Shared by the
+    per-model rollup and the per-day attribution so both price identically."""
+    pricing = _pricing_for(model)
+    if pricing is None:
+        return (0.0, 0.0, 0.0)
+    cached = max(0, min(usage.cached_input_tokens, usage.input_tokens))
+    non_cached = max(0, usage.input_tokens - cached)
+    cached_rate = (
+        pricing.input_usd_per_mtok
+        if pricing.cached_input_usd_per_mtok is None
+        else pricing.cached_input_usd_per_mtok
+    )
+    return (
+        non_cached * pricing.input_usd_per_mtok / 1e6,
+        cached * cached_rate / 1e6,
+        usage.output_tokens * pricing.output_usd_per_mtok / 1e6,
+    )
 
 
 def _fmt_reset(resets_at: int | float | None) -> str:
@@ -610,7 +632,7 @@ def parse(
     base_hash = hashlib.md5("\x00".join(str(b.resolve()) for b in bases).encode()).hexdigest()[:12]
     if cache_dir is None:
         cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    cache_path = cache_dir / f"codex-sessions-v4-{base_hash}.json"
+    cache_path = cache_dir / f"codex-sessions-v5-{base_hash}.json"
     fp = _dir_fingerprint(files)
     cached = _load_codex_cache(cache_path)
     if cached and cached.get("fp") == fp:
@@ -665,14 +687,7 @@ def parse(
             model_costs[model] = 0.0
             continue
 
-        cached_rate = (
-            pricing.input_usd_per_mtok
-            if pricing.cached_input_usd_per_mtok is None
-            else pricing.cached_input_usd_per_mtok
-        )
-        ic = non_cached * pricing.input_usd_per_mtok / 1e6
-        cc = cached * cached_rate / 1e6
-        oc = usage.output_tokens * pricing.output_usd_per_mtok / 1e6
+        ic, cc, oc = _usage_cost_parts(model, usage)
         model_costs[model] = ic + cc + oc
 
         cb.input_tokens += non_cached

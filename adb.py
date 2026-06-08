@@ -695,6 +695,7 @@ def print_stats(
         "Recent":          "bold cornflower_blue",
         "Models":          "bold medium_purple",
         "Cost":            f"bold {ACCENT}",
+        "Growth":          "bold #5fd7af",
         "Activity":        "bold deep_sky_blue1",
         "Machines":        "bold #87afaf",
         "Projects (Top 10)": "bold #87d787",
@@ -914,6 +915,75 @@ def print_stats(
         f"(elapsed-period run-rate)[/dim]"
     )
     console.print(_section(Group(recent, proj), "Recent"))
+
+    # --- 1.5 GROWTH (cumulative tokens + cost over time) ---
+    # The running total the snapshots above never show: how the lifetime token and
+    # dollar figures accumulated, one calendar month per row. Tokens are spread by
+    # daily-output share (the same tok_ratio Recent uses — no per-day input/cache
+    # breakdown exists), so they reconcile to the lifetime total; cost is the REAL
+    # per-day DayActivity.cost sum, so the two series diverge where the model mix
+    # shifts. A global cost_scale (≈1.0) folds back any per-day attribution gap
+    # (Claude stats-cache-only days, Grok undated sessions) so Σ hits the headline.
+    if combined.daily:
+        months: dict[tuple[int, int], list] = {}  # (year, month) -> [output_tokens, cost]
+        for da in combined.daily:
+            b = months.setdefault((da.day.year, da.day.month), [0, 0.0])
+            b[0] += da.output_tokens
+            b[1] += da.cost
+        total_daily_out = sum(b[0] for b in months.values())
+        total_daily_cost = sum(b[1] for b in months.values())
+        # Spread the EXACT lifetime totals across months by each month's share, so
+        # the monthly deltas sum to the final Σ AND the final Σ equals the headline.
+        tok_scale = total_tokens / total_daily_out if total_daily_out else 0
+        cost_scale = total_cost / total_daily_cost if total_daily_cost else 0
+        ordered = sorted(months.items())
+
+        gr_rows = []
+        cum_out = 0
+        cum_cost = 0.0
+        for i, ((y, m), (mout, mcost)) in enumerate(ordered):
+            cum_out += mout
+            cum_cost += mcost
+            last = i == len(ordered) - 1
+            cum_cost_s = cum_cost * cost_scale
+            gr_rows.append({
+                "month": f"{calendar.month_abbr[m]} {y}",
+                "dtok": f"~{fmt_tokens(int(mout * tok_scale))}",
+                "stok": fmt_tokens(total_tokens) if last else f"~{fmt_tokens(int(cum_out * tok_scale))}",
+                "dcost": fmt_cost(mcost * cost_scale),
+                "scost": fmt_cost(total_cost) if last else fmt_cost(cum_cost_s),
+                "share": (cum_cost_s / total_cost) if total_cost else 0,
+            })
+
+        def _gw(key, header):
+            return max(len(header), max(len(r[key]) for r in gr_rows))
+        month_w, dtok_w, stok_w, dcost_w, scost_w = (
+            _gw("month", "Month"), _gw("dtok", "+Tokens"), _gw("stok", "Σ Tokens"),
+            _gw("dcost", "+Cost"), _gw("scost", "Σ Cost"),
+        )
+        # Fill the panel: inner − 5 text cols − their pads − " 100%" suffix − safety
+        # margin (rich's SIMPLE_HEAD width rounding truncates columns if too tight).
+        GBAR = max(10, (width - 4) - month_w - dtok_w - stok_w - dcost_w - scost_w - 18)
+
+        growth_tbl = Table(box=box.SIMPLE_HEAD, show_edge=False, padding=(0, 1, 0, 0), header_style="dim", expand=False)
+        growth_tbl.add_column("Month", style="bold", no_wrap=True)
+        growth_tbl.add_column("+Tokens", justify="right", no_wrap=True)
+        growth_tbl.add_column("Σ Tokens", justify="right", no_wrap=True)
+        growth_tbl.add_column("+Cost", justify="right", no_wrap=True)
+        growth_tbl.add_column("Σ Cost", justify="right", no_wrap=True)
+        growth_tbl.add_column("Cumulative $", no_wrap=True)
+        for r in gr_rows:
+            filled = int(round(r["share"] * GBAR))
+            bar = f"[#5fd7af]{'█' * filled}[/#5fd7af][bright_black]{'░' * (GBAR - filled)}[/bright_black]"
+            growth_tbl.add_row(
+                r["month"], r["dtok"], r["stok"],
+                Text.from_markup(f"[{ACCENT}]{r['dcost']}[/{ACCENT}]"),
+                Text.from_markup(f"[{ACCENT}]{r['scost']}[/{ACCENT}]"),
+                Text.from_markup(f"{bar} [dim]{r['share'] * 100:.0f}%[/dim]"),
+            )
+        since = first_date.isoformat() if first_date else "start"
+        gfoot = Text(f"cumulative since {since} · tokens ~spread by daily output · bar = Σ cost share", style="dim")
+        console.print(_section(Group(growth_tbl, gfoot), "Growth"))
 
     # --- 2. COST ---
     cost_total = agg_cb.total_cost
@@ -1226,29 +1296,49 @@ def print_stats(
         other = sum(c for _, c in tools_sorted[TOP_N:])
         if other > 0:
             rows = rows + [("other", other)]
+        # Tag each tool with the agent framework that emits it (Claude vs Codex),
+        # read from the per-agent maps before they were summed into `combined`. The
+        # tail "other" row unions the frameworks of the tools it rolls up.
+        tool_src: dict[str, set[str]] = {}
+        for st, key in ((claude, "claude"), (codex, "codex")):
+            if st:
+                for nm in st.tool_calls_by_name:
+                    tool_src.setdefault(nm, set()).add(key)
+        tail_src = set().union(*(tool_src.get(n, set()) for n, _ in tools_sorted[TOP_N:])) if other > 0 else set()
+
+        def _src_tag(name: str) -> Text:
+            fws = tail_src if name == "other" else tool_src.get(name, set())
+            if len(fws) == 1:
+                k = next(iter(fws))
+                return Text(TOOL_NAMES[k], style=TOOL_COLORS[k])
+            return Text("both" if fws else "—", style="dim")
+
         # The bar is the panel's primary signal — a fixed 16-cell bar under-resolved
         # the distribution (everything > 6% maxed out) AND left dead space. Size it to
-        # FILL the panel: budget = inner width − name − count − pct − pads. The panel
-        # is the ratio-3 half of the 3:2 pair (or full width when stacked < PAIR_MIN),
-        # estimated from `width`; a 1-col safety margin keeps it from overflowing if
-        # rich's ratio rounding differs. Name truncates to 18 to bound the worst case.
+        # FILL the panel: budget = inner width − src − name − count − pct − pads. The
+        # panel is the ratio-3 half of the 3:2 pair (or full width when stacked <
+        # PAIR_MIN), estimated from `width`; a 1-col safety margin keeps it from
+        # overflowing if rich's ratio rounding differs. Name truncates to 18.
         names = [_trunc(n, 18) for n, _ in rows]
         counts = [f"{c:,}" for _, c in rows]
+        src_tags = [_src_tag(n) for n, _ in rows]
         name_w = max((len(n) for n in names), default=4)
         count_w = max((len(c) for c in counts), default=1)
+        src_w = max((len(t.plain) for t in src_tags), default=1)
         tools_inner = (round(width * 3 / 5) if width >= PAIR_MIN_WIDTH else width) - 4
-        TBAR = max(10, tools_inner - name_w - count_w - 6 - 4)  # 6=pct ("100.0%"), 4=pads+safety
+        TBAR = max(10, tools_inner - src_w - name_w - count_w - 6 - 5)  # 6=pct ("100.0%"), 5=pads+safety
         tools_table = Table(box=None, show_header=False, show_edge=False, padding=(0, 1, 0, 0), expand=False)
+        tools_table.add_column("src", no_wrap=True)
         tools_table.add_column("tool", style="bold", no_wrap=True)
         tools_table.add_column("count", justify="right", no_wrap=True)
         tools_table.add_column("bar", no_wrap=True)
         tools_table.add_column("pct", justify="right", style="dim", no_wrap=True)
-        for (name, cnt), disp_name in zip(rows, names):
+        for (name, cnt), disp_name, tag in zip(rows, names, src_tags):
             pct = cnt / tool_total if tool_total else 0
             filled = int(pct * TBAR)
             bar = f"[#d7afd7]{'█' * filled}[/#d7afd7][bright_black]{'░' * (TBAR - filled)}[/bright_black]"
-            tools_table.add_row(disp_name, f"{cnt:,}", Text.from_markup(bar), fmt_pct(cnt, tool_total))
-        footnote = Text("Claude+Codex calls · % of named", style="dim")
+            tools_table.add_row(tag, disp_name, f"{cnt:,}", Text.from_markup(bar), fmt_pct(cnt, tool_total))
+        footnote = Text("by agent · % of named calls", style="dim")
         tools_body = Group(tools_table, footnote)
 
     # Weekday × hour message activity, local time.
@@ -1289,8 +1379,14 @@ def print_stats(
         # so the pairing helper's blank padding line disappears.
         hour_marg = [sum(combined.heatmap[wd * 24 + h] for wd in range(7)) for h in range(24)]
         heat_tbl.add_row(Text("Σ", style="bold"), _heat_cells(hour_marg, max(hour_marg) or 1), fmt_tokens(sum(hour_marg)))
-        heat_foot = Text("┊ 0/6/12/18h · brighter→busier", style="dim")
-        heat_body = Group(heat_tbl, heat_foot)
+        # Hour axis: place the labels directly under their ┊ ticks instead of a legend.
+        hour_lbl = [" "] * 24
+        for h in range(0, 24, 6):
+            for j, ch in enumerate(str(h)):
+                if h + j < 24:
+                    hour_lbl[h + j] = ch
+        heat_tbl.add_row(Text(""), Text("".join(hour_lbl), style="grey42"), Text(""))
+        heat_body = heat_tbl
 
     # Tools needs the width (long names + bars); the heatmap is a fixed 24-col grid,
     # so a 3:2 split fits both. If only one has data, render it full-width.

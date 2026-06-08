@@ -88,12 +88,14 @@ class DayActivity:
     sessions: int = 0
     tool_calls: int = 0
     output_tokens: int = 0
+    cost: float = 0.0
 
     def add(self, other: DayActivity) -> None:
         self.messages += other.messages
         self.sessions += other.sessions
         self.tool_calls += other.tool_calls
         self.output_tokens += other.output_tokens
+        self.cost += other.cost
 
 
 @dataclass
@@ -241,6 +243,7 @@ class ToolStats:
                     "sessions": da.sessions,
                     "tool_calls": da.tool_calls,
                     "output_tokens": da.output_tokens,
+                    "cost": round(da.cost, 4),
                 }
                 for da in self.daily
             ],
@@ -327,6 +330,7 @@ class ToolStats:
                     sessions=d.get("sessions", 0),
                     tool_calls=d.get("tool_calls", 0),
                     output_tokens=d.get("output_tokens", 0),
+                    cost=d.get("cost", 0.0),
                 )
                 for d in data.get("daily", [])
             ],

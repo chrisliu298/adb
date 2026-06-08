@@ -39,7 +39,7 @@ def _write_session(path: Path, records: list[dict]) -> None:
 
 
 def _clear_cache() -> None:
-    for c in (Path(__file__).resolve().parent.parent / ".cache").glob("claude-daily5-*.json"):
+    for c in (Path(__file__).resolve().parent.parent / ".cache").glob("claude-daily6-*.json"):
         c.unlink()
 
 
