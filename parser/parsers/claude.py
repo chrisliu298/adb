@@ -271,6 +271,20 @@ def _parse_date(s: str) -> date | None:
             return None
 
 
+def _local_wh(ts) -> int | None:
+    """weekday*24 + hour in LOCAL time from an ISO string or epoch-ms (None if bad)."""
+    try:
+        if isinstance(ts, str):
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+        elif isinstance(ts, (int, float)):
+            dt = datetime.fromtimestamp(ts / 1000)
+        else:
+            return None
+    except (ValueError, OSError):
+        return None
+    return dt.weekday() * 24 + dt.hour
+
+
 _TERMINAL_STOP_REASONS = frozenset(
     ("end_turn", "tool_use", "stop_sequence", "max_tokens", "pause_turn", "refusal")
 )
@@ -420,6 +434,9 @@ def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
     project_duration: dict[str, int] = defaultdict(int)
     project_paths: dict[str, str] = {}
     seen_ids: set[str] = set()
+    # Per-transcript costs for the session-cost distribution: the same effective
+    # (dedup-adjusted) cost that lands in project_costs, one entry per session file.
+    session_costs: list[float] = []
 
     for proj_key, proj_dir in _iter_project_dirs(bases):
         for jsonl_file in _iter_session_files(proj_dir):
@@ -446,6 +463,7 @@ def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
                         project_costs[proj_key] += cost
                         project_output[proj_key] += out
                         seen_ids.update(file_ids)
+                        session_costs.append(cost)
                     else:
                         # Some IDs already seen; must re-derive cost
                         # This is rare (subagent files sharing message IDs)
@@ -455,6 +473,7 @@ def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
                             ratio = len(new_ids) / len(file_ids)
                             project_costs[proj_key] += cost * ratio
                             project_output[proj_key] += int(out * ratio)
+                            session_costs.append(cost * ratio)
                 project_duration[proj_key] += dur
                 if cwd and proj_key not in project_paths:
                     project_paths[proj_key] = cwd
@@ -467,9 +486,13 @@ def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
                     ratio = len(new_ids) / len(file_ids)
                     project_costs[proj_key] += cost * ratio
                     project_output[proj_key] += int(out * ratio)
+                    if cost * ratio > 0:
+                        session_costs.append(cost * ratio)
                 else:
                     project_costs[proj_key] += cost
                     project_output[proj_key] += out
+                    if cost > 0:
+                        session_costs.append(cost)
                 project_duration[proj_key] += dur
                 seen_ids.update(file_ids)
                 if cwd and proj_key not in project_paths:
@@ -499,7 +522,7 @@ def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
                 duration_ms=project_duration.get(proj_key, 0),
             )
         )
-    return sorted(result, key=lambda p: p.cost, reverse=True)
+    return sorted(result, key=lambda p: p.cost, reverse=True), session_costs
 
 
 PROJECTS_BASE = Path.home() / ".claude" / "projects"
@@ -744,11 +767,18 @@ def _load_all_tokens(
 
 def _parse_session_events(
     jsonl_file: Path,
-) -> list[tuple[str, str, str, int, int]]:
+) -> list[list]:
     """Parse one JSONL file into per-message events for daily aggregation.
 
-    Returns a list of tuples: (day_str, role, mid, tool_count, output_tokens).
+    Returns a list of
+    [day_str, role, mid, tool_count, output_tokens, tool_names, wh, model, stop_reason].
     - role is "u" for user turns, "a" for assistant turns.
+    - tool_names is the list of tool_use block names on that assistant message
+      (empty for user events); the aggregator counts them per-name once the
+      message survives msg.id dedup, so a per-tool breakdown matches tool_calls.
+    - wh is weekday*24 + hour in local time (for the activity heatmap); model and
+      stop_reason are the assistant message's model id and terminal reason (for the
+      model-adoption timeline and stop-reason distribution). Empty for user events.
     - Each unique msg.id emits exactly one assistant event, picking the
       variant with a terminal stop_reason and largest output_tokens (handles
       streaming partials and recovers messages whose stop_reason was never
@@ -756,9 +786,9 @@ def _parse_session_events(
     - Assistant mids let the aggregator dedup messages that appear in multiple
       session files (e.g. subagent replay), which otherwise inflates daily counts.
     """
-    user_events: list[tuple[str, str, str, int, int]] = []
-    # mid -> (day_str, tool_count, output_tokens, terminal)
-    asst_by_mid: dict[str, tuple[str, int, int, bool]] = {}
+    user_events: list[list] = []
+    # mid -> (day_str, tool_count, output_tokens, terminal, tool_names, wh, model, stop_reason)
+    asst_by_mid: dict[str, tuple] = {}
     try:
         with jsonl_file.open("rb") as f:
             for line in f:
@@ -781,67 +811,81 @@ def _parse_session_events(
                     ).strftime("%Y-%m-%d")
                 else:
                     continue
+                wh = _local_wh(ts)
 
                 msg = obj.get("message")
                 if not msg:
                     continue
                 role = msg.get("role")
                 if role == "user":
-                    user_events.append((day_str, "u", "", 0, 0))
+                    user_events.append([day_str, "u", "", 0, 0, [], wh, "", ""])
                 elif role == "assistant":
                     mid = msg.get("id", "") or ""
                     if not mid:
                         continue
                     content = msg.get("content", [])
-                    tool_count = 0
+                    tool_names: list[str] = []
                     if isinstance(content, list):
-                        tool_count = sum(
-                            1
+                        tool_names = [
+                            c["name"]
                             for c in content
-                            if isinstance(c, dict) and c.get("type") == "tool_use"
-                        )
+                            if isinstance(c, dict)
+                            and c.get("type") == "tool_use"
+                            and c.get("name")
+                        ]
+                    tool_count = len(tool_names)
                     usage = msg.get("usage") or {}
                     otoks = usage.get("output_tokens", 0) or 0
-                    terminal = msg.get("stop_reason") in _TERMINAL_STOP_REASONS
+                    sr = msg.get("stop_reason") or ""
+                    terminal = sr in _TERMINAL_STOP_REASONS
+                    model = msg.get("model", "") or ""
                     cur = asst_by_mid.get(mid)
                     if cur is None:
-                        asst_by_mid[mid] = (day_str, tool_count, otoks, terminal)
+                        asst_by_mid[mid] = (day_str, tool_count, otoks, terminal, tool_names, wh, model, sr)
                     else:
-                        _, cur_tools, cur_otoks, cur_terminal = cur
+                        cur_otoks, cur_terminal = cur[2], cur[3]
                         if (terminal and not cur_terminal) or (
                             terminal == cur_terminal and otoks > cur_otoks
                         ):
-                            asst_by_mid[mid] = (day_str, tool_count, otoks, terminal)
+                            asst_by_mid[mid] = (day_str, tool_count, otoks, terminal, tool_names, wh, model, sr)
     except OSError:
         pass
 
     events = list(user_events)
-    for mid, (day_str, tool_count, otoks, _) in asst_by_mid.items():
-        events.append((day_str, "a", mid, tool_count, otoks))
+    for mid, v in asst_by_mid.items():
+        day_str, tool_count, otoks, _term, tool_names, wh, model, sr = v
+        events.append([day_str, "a", mid, tool_count, otoks, tool_names, wh, model, sr])
     return events
 
 
 def _build_daily_from_sessions(
     projects_dirs: list[Path],
-) -> list[DayActivity]:
+) -> tuple[list[DayActivity], dict]:
     """Build daily activity from session JSONL files with caching and global dedup.
 
     Assistant messages are deduped by msg.id across files to avoid inflating
     daily output_tokens/messages/tool_calls when subagent sessions replay
-    messages from a parent session.
+    messages from a parent session. Returns (daily, aux), where aux carries the
+    per-tool-name counts, the weekday×hour activity heatmap, per-model first-seen
+    dates, and the stop-reason distribution — all accumulated under the same
+    msg.id dedup so they reconcile with the daily counts.
     """
     import hashlib
 
     dirs_str = ":".join(sorted(str(d) for d in projects_dirs))
     dirs_hash = hashlib.md5(dirs_str.encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    # v3: per-mid dedup in _parse_session_events picks largest-output variant
-    # and admits messages whose stop_reason was never finalized in the log.
-    cache_path = cache_dir / f"claude-daily3-{dirs_hash}.json"
+    # v5: events carry tool_use names [5], weekday×hour [6], model [7], stop_reason
+    # [8]; v4 stored only 6-element events without the heatmap/model/stop_reason.
+    cache_path = cache_dir / f"claude-daily5-{dirs_hash}.json"
     cache = _load_cache(cache_path)
     cache_dirty = False
 
     agg: dict[str, list[int]] = {}  # date → [msgs, sessions, tools, otoks]
+    tool_by_name: dict[str, int] = {}
+    heatmap = [0] * 168            # weekday*24 + hour message counts (local time)
+    stop_reasons: dict[str, int] = {}
+    model_first_seen: dict[str, str] = {}  # model -> earliest ISO day seen
     seen_asst_ids: set[str] = set()
     # Dedup the same session FILE across this host's bases, keyed on its path
     # relative to the base. A remote host is read as its rsync mirror PLUS its
@@ -884,8 +928,11 @@ def _build_daily_from_sessions(
                     file_days.add(day_str)
                     if day_str not in agg:
                         agg[day_str] = [0, 0, 0, 0]
+                    wh = ev[6] if len(ev) > 6 else None
                     if role == "u":
                         agg[day_str][0] += 1
+                        if isinstance(wh, int) and 0 <= wh < 168:
+                            heatmap[wh] += 1
                     elif role == "a":
                         if mid:
                             if mid in seen_asst_ids:
@@ -894,6 +941,18 @@ def _build_daily_from_sessions(
                         agg[day_str][0] += 1
                         agg[day_str][2] += tool_count
                         agg[day_str][3] += otoks
+                        for _name in (ev[5] if len(ev) > 5 else ()):
+                            tool_by_name[_name] = tool_by_name.get(_name, 0) + 1
+                        if isinstance(wh, int) and 0 <= wh < 168:
+                            heatmap[wh] += 1
+                        _model = ev[7] if len(ev) > 7 else ""
+                        if _model:
+                            prev = model_first_seen.get(_model)
+                            if prev is None or day_str < prev:
+                                model_first_seen[_model] = day_str
+                        _sr = ev[8] if len(ev) > 8 else ""
+                        if _sr:
+                            stop_reasons[_sr] = stop_reasons.get(_sr, 0) + 1
 
                 # Count session: 1 per file, attributed to first day
                 if file_days:
@@ -920,7 +979,13 @@ def _build_daily_from_sessions(
                 output_tokens=v[3],
             )
         )
-    return sorted(result, key=lambda x: x.day)
+    aux = {
+        "tool_calls_by_name": tool_by_name,
+        "heatmap": heatmap,
+        "stop_reasons": stop_reasons,
+        "model_first_seen": model_first_seen,
+    }
+    return sorted(result, key=lambda x: x.day), aux
 
 
 def parse(
@@ -985,7 +1050,8 @@ def parse(
                 projects_dirs.append(_d)
 
     # Session-derived daily — the authoritative source when available.
-    session_daily = _build_daily_from_sessions(projects_dirs)
+    session_daily, _aux = _build_daily_from_sessions(projects_dirs)
+    tool_calls_by_name = _aux["tool_calls_by_name"]
     session_days = {sd.day for sd in session_daily}
     for sd in session_daily:
         if sd.day in daily_map:
@@ -1111,8 +1177,9 @@ def parse(
     longest_dur = ls.get("duration", 0)
     longest_msgs = ls.get("messageCount", 0)
 
-    # Projects (from session logs for cumulative costs)
-    projects = _load_projects_from_sessions(_bases)
+    # Projects (from session logs for cumulative costs) + per-transcript costs
+    # for the session-cost distribution.
+    projects, session_costs = _load_projects_from_sessions(_bases)
 
     return ToolStats(
         source="claude",
@@ -1130,6 +1197,11 @@ def parse(
         hour_counts=hour_counts,
         rate_limits=rate_limits,
         projects=projects,
+        tool_calls_by_name=tool_calls_by_name,
+        session_costs=session_costs,
+        heatmap=_aux["heatmap"],
+        stop_reasons=_aux["stop_reasons"],
+        model_first_seen=_aux["model_first_seen"],
         longest_session_duration_ms=longest_dur,
         longest_session_messages=longest_msgs,
         unpriced_models=unpriced_models,

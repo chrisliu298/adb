@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import re
 import sys
@@ -86,6 +87,25 @@ def _merge_two(a: ToolStats, b: ToolStats) -> ToolStats:
             else:
                 daily_map[d.day] = copy(d)
     hour_counts = {h: a.hour_counts.get(h, 0) + b.hour_counts.get(h, 0) for h in range(24)}
+    tool_calls_by_name: dict[str, int] = {}
+    for src in (a, b):
+        for name, cnt in src.tool_calls_by_name.items():
+            tool_calls_by_name[name] = tool_calls_by_name.get(name, 0) + cnt
+    heatmap = [a.heatmap[i] + b.heatmap[i] for i in range(168)]
+    stop_reasons: dict[str, int] = {}
+    for src in (a, b):
+        for r, cnt in src.stop_reasons.items():
+            stop_reasons[r] = stop_reasons.get(r, 0) + cnt
+    model_first_seen: dict[str, str] = {}
+    for src in (a, b):
+        for m, d in src.model_first_seen.items():
+            cur = model_first_seen.get(m)
+            if cur is None or d < cur:
+                model_first_seen[m] = d
+    rate_limit_history: dict[str, float] = {}
+    for src in (a, b):
+        for d, pct in src.rate_limit_history.items():
+            rate_limit_history[d] = max(rate_limit_history.get(d, 0.0), pct)
     first_dates = [s.first_date for s in (a, b) if s.first_date]
     proj_map: dict[str, ProjectInfo] = {}
     for p in a.projects + b.projects:
@@ -110,6 +130,12 @@ def _merge_two(a: ToolStats, b: ToolStats) -> ToolStats:
         hour_counts=hour_counts,
         rate_limits=a.rate_limits or b.rate_limits,
         projects=projects,
+        tool_calls_by_name=tool_calls_by_name,
+        session_costs=a.session_costs + b.session_costs,
+        heatmap=heatmap,
+        stop_reasons=stop_reasons,
+        model_first_seen=model_first_seen,
+        rate_limit_history=rate_limit_history,
         longest_session_duration_ms=(a.longest_session_duration_ms if a.longest_session_duration_ms >= b.longest_session_duration_ms else b.longest_session_duration_ms),
         longest_session_messages=(a.longest_session_messages if a.longest_session_duration_ms >= b.longest_session_duration_ms else b.longest_session_messages),
         unpriced_models=a.unpriced_models | b.unpriced_models,
@@ -672,6 +698,9 @@ def print_stats(
         "Activity":        "bold deep_sky_blue1",
         "Machines":        "bold #87afaf",
         "Projects (Top 10)": "bold #87d787",
+        "Tools":           "bold #d7afd7",
+        "Agents":          "bold #5fafd7",
+        "Heatmap":         "bold deep_sky_blue1",
     }
 
     def fmt_cost_styled(c: float) -> str:
@@ -830,7 +859,15 @@ def print_stats(
     w_cost_cell = Text.from_markup(f"[{ACCENT}]~{fmt_cost(w_cost)}[/{ACCENT}]{w_delta_rich}")
     m_cost_cell = Text.from_markup(f"[{ACCENT}]~{fmt_cost(m_cost)}[/{ACCENT}]{m_delta_rich}")
     recent.add_row("Est. Cost", Text.from_markup(f"[{ACCENT}]~{fmt_cost(t_cost)}[/{ACCENT}]"), w_cost_cell, m_cost_cell, Text.from_markup(fmt_cost_styled(total_cost)))
-    console.print(_section(recent, "Recent"))
+    # Run-rate projection: extrapolate elapsed-period spend to the full period.
+    days_in_month = calendar.monthrange(today.year, today.month)[1]
+    proj_week = w_cost / n_week_days * 7 if n_week_days else 0
+    proj_month = m_cost / today.day * days_in_month if today.day else 0
+    proj = Text.from_markup(
+        f"[dim]Pace → week ~{fmt_cost(proj_week)} · month ~{fmt_cost(proj_month)} "
+        f"(elapsed-period run-rate)[/dim]"
+    )
+    console.print(_section(Group(recent, proj), "Recent"))
 
     # --- 2. COST ---
     cost_total = agg_cb.total_cost
@@ -866,14 +903,40 @@ def print_stats(
     cost_summary.add_column("value", no_wrap=True, ratio=1)
     cache_color = "green" if cache_hit_rate > 90 else ("yellow" if cache_hit_rate > 70 else "default")
     cost_summary.add_row("Cache Hit", Text.from_markup(f"[{cache_color}]{cache_hit_rate:.1f}%[/{cache_color}] saved [{ACCENT}]~{fmt_cost(cache_savings)}[/{ACCENT}]"))
+    # Cache-write TTL split (1h costs 2x input, 5m 1.25x) + write:read ratio.
+    # Both read straight off the already-parsed token breakdown.
+    cw_total = combined.total_tokens.cache_write_tokens
+    cw_1h = combined.total_tokens.cache_write_1h_tokens
+    if cw_total > 0:
+        h_pct = cw_1h / cw_total * 100
+        wr = cw_total / total_cache_read if total_cache_read else 0
+        cost_summary.add_row("Cache TTL", f"1h {h_pct:.0f}% \u00b7 5m {100 - h_pct:.0f}% \u00b7 W:R {wr:.2f}")
     cost_per_day = fmt_cost_styled(total_cost / days_active) if days_active else "\u2014"
     cost_per_session = fmt_cost_styled(total_cost / total_sessions) if total_sessions else "\u2014"
     cost_summary.add_row("Cost/Day", Text.from_markup(cost_per_day) if days_active else cost_per_day)
     cost_summary.add_row("Cost/Sess", Text.from_markup(cost_per_session) if total_sessions else cost_per_session)
+    # Session-cost distribution: the average above hides the shape. The top-1%-of-
+    # sessions share is the concentration headline \u2014 is spend a few runaway sessions
+    # or evenly spread? (Claude entries are per-transcript; Codex per session.)
+    sc = sorted(combined.session_costs)
+    if sc:
+        sc_total = sum(sc)
+        k = max(1, int(0.01 * len(sc)))  # top 1% of sessions, at least one
+        top1_share = sum(sc[-k:]) / sc_total * 100 if sc_total else 0
+        cost_summary.add_row(
+            "Sess Dist",
+            f"[{ACCENT}]top 1% = {top1_share:.0f}%[/{ACCENT}] of spend",
+        )
     cost_per_msg = fmt_cost_styled(total_cost / total_messages) if total_messages else "\u2014"
     cost_summary.add_row("Cost/Msg", Text.from_markup(cost_per_msg) if total_messages else cost_per_msg)
     cost_per_ktok = f"[{ACCENT}]${total_cost / total_tokens * 1000:.4f}[/{ACCENT}]" if total_tokens else "\u2014"
     cost_summary.add_row("Cost/1K Tok", Text.from_markup(cost_per_ktok) if total_tokens else cost_per_ktok)
+    # Reasoning-token share (Codex-only; reasoning is a subset of output tokens
+    # billed at the output rate but never user-visible). Gated on >0.
+    reasoning_toks = combined.total_tokens.reasoning_tokens
+    if reasoning_toks > 0 and total_output_tokens > 0:
+        r_pct = reasoning_toks / total_output_tokens * 100
+        cost_summary.add_row("Reasoning", f"{fmt_tokens(reasoning_toks)} \u00b7 {r_pct:.0f}% of output [grey50](Codex)[/grey50]")
     _cost_tc = SECTION_COLORS.get("Cost", "bold")
     cost_panel = Panel(
         Group(cost_bar_table, Text(""), cost_summary),
@@ -947,10 +1010,33 @@ def print_stats(
             names = ", ".join(sorted(combined.unpriced_models))
             models_table.add_row(Text(f"Unpriced: {names} ({fmt_tokens(combined.unpriced_tokens)})", style="yellow"), "", "", "", "", "", "", "", "")
         footnote = Text("In/Out $/M = token-weighted list price (family rows blend versions) \u00b7 % = share of total cost", style="dim")
-        console.print(_section(Group(models_table, Text(""), footnote), "Models"))
+        model_extras = [Text(""), footnote]
+        # Model-adoption timeline: the most recently first-seen models, so a cost
+        # jump can be traced to "started using model X on date Y".
+        if combined.model_first_seen:
+            newest = sorted(combined.model_first_seen.items(), key=lambda kv: kv[1], reverse=True)[:3]
+            parts = []
+            for m, d in newest:
+                try:
+                    lbl = date.fromisoformat(d).strftime("%b %d")
+                except ValueError:
+                    lbl = d
+                parts.append(f"{m} ({lbl})")
+            model_extras.insert(1, Text("Newest: " + " \u00b7 ".join(parts), style="dim"))
+        console.print(_section(Group(models_table, *model_extras), "Models"))
 
     # --- 3. ACTIVITY ---
     SPARK_BLOCKS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+
+    def _sparkline(vals) -> Text:
+        """8-level gradient sparkline scaled to the series max (0 \u2192 lowest block)."""
+        mx = max(vals) or 1
+        t = Text()
+        for v in vals:
+            idx = min(7, max(0, int(v / mx * 7))) if v > 0 else 0
+            t.append(SPARK_BLOCKS[idx], style=SPARK_GRADIENT[idx])
+        return t
+
     act = Table(box=None, show_header=False, show_edge=False, padding=(0, 1, 0, 0), expand=True)
     act.add_column("key", style="bold", no_wrap=True)
     act.add_column("value", no_wrap=True, ratio=1)
@@ -974,13 +1060,8 @@ def print_stats(
         act.add_row("Peak Hour", f"{peak_h}:00-{(peak_h + 1) % 24}:00")
     if total_hourly_msgs > 0:
         tok_by_hour = [int(total_tokens * merged_hours.get(h, 0) / total_hourly_msgs) for h in range(24)]
-        mx_h = max(tok_by_hour)
-        if mx_h > 0:
-            spark_h = Text()
-            for v in tok_by_hour:
-                idx = min(7, max(0, int(v / mx_h * 7))) if v > 0 else 0
-                spark_h.append(SPARK_BLOCKS[idx], style=SPARK_GRADIENT[idx])
-            act.add_row("Tok/Hour", spark_h)
+        if any(v > 0 for v in tok_by_hour):
+            act.add_row("Tok/Hour", _sparkline(tok_by_hour))
     act.add_row("Streak", f"{streak} day{'s' if streak != 1 else ''}")
     longest_dur = combined.longest_session_duration_ms
     longest_msgs = combined.longest_session_messages
@@ -993,6 +1074,22 @@ def print_stats(
 
         act.add_row("Avg Sess", " · ".join(sess_parts))
 
+    density_parts = []
+    if total_messages > 0:
+        density_parts.append(f"{total_tool_calls / total_messages:,.1f} tools/msg")
+    if total_turns > 0:
+        density_parts.append(f"{total_messages / total_turns:,.1f} msg/turn")
+    if density_parts:
+        act.add_row("Density", " · ".join(density_parts))
+
+    # Stop-reason distribution (Claude): how assistant turns ended. A high
+    # max_tokens/refusal share is a friction signal; tool_use dominates agentic work.
+    if combined.stop_reasons:
+        sr_total = sum(combined.stop_reasons.values())
+        sr_sorted = sorted(combined.stop_reasons.items(), key=lambda kv: kv[1], reverse=True)
+        sr_parts = [f"{r} {c / sr_total * 100:.0f}%" for r, c in sr_sorted[:3]]
+        act.add_row("Stops", " · ".join(sr_parts))
+
     # Sparkline for last 14 days
     last_14_values: list[int] = []
     last_14_dates: list[date] = []
@@ -1002,15 +1099,38 @@ def print_stats(
         last_14_values.append(da.output_tokens if da else 0)
         last_14_dates.append(d)
     if any(v > 0 for v in last_14_values):
-        mx = max(last_14_values)
-        spark_14 = Text()
-        for v in last_14_values:
-            idx = min(7, max(0, int(v / mx * 7))) if v > 0 else 0
-            spark_14.append(SPARK_BLOCKS[idx], style=SPARK_GRADIENT[idx])
-        start_lbl = last_14_dates[0].strftime("%b %d")
-        end_lbl = last_14_dates[-1].strftime("%b %d")
-        spark_14.append(f" {start_lbl} \u2192 {end_lbl}")
+        spark_14 = _sparkline(last_14_values)
+        # Momentum: last 7 days vs the prior 7 days, as a colored arrow \u2014 the new
+        # signal a flat sparkline can't convey at a glance.
+        prior7, recent7 = sum(last_14_values[:7]), sum(last_14_values[7:])
+        if prior7 > 0:
+            tpct = (recent7 - prior7) / prior7 * 100
+            if tpct >= 0:
+                spark_14.append(f" \u2191{tpct:.0f}%/wk", style="#5fd787")
+            else:
+                spark_14.append(f" \u2193{abs(tpct):.0f}%/wk", style="#d75f5f")
         act.add_row("Last 14d", spark_14)
+
+    # Tool-call sparkline (last 14d) \u2014 a genuinely different shape from output
+    # tokens (a spike in tool calls often precedes a cost spike).
+    last_14_tools: list[int] = []
+    for i in range(13, -1, -1):
+        da = daily_by_date.get(today - timedelta(days=i))
+        last_14_tools.append(da.tool_calls if da else 0)
+    if any(t > 0 for t in last_14_tools):
+        spark_t = _sparkline(last_14_tools)
+        spark_t.append(f" {sum(last_14_tools):,} calls")
+        act.add_row("Tools 14d", spark_t)
+
+    # Codex 5-Hour rate-limit utilization (last 14d): are you chronically redlining
+    # the cap, or is the latest gauge just a transient spike?
+    if combined.rate_limit_history:
+        rl_vals = [combined.rate_limit_history.get((today - timedelta(days=i)).isoformat(), 0.0)
+                   for i in range(13, -1, -1)]
+        if any(v > 0 for v in rl_vals):
+            spark_rl = _sparkline(rl_vals)
+            spark_rl.append(f" peak {max(rl_vals):.0f}%")
+            act.add_row("RL 5h", spark_rl)
 
     _act_tc = SECTION_COLORS.get("Activity", "bold")
     activity_panel = Panel(
@@ -1024,6 +1144,95 @@ def print_stats(
     side_by_side.add_column("right", ratio=1)
     side_by_side.add_row(cost_panel, activity_panel)
     console.print(side_by_side)
+
+    # --- 4b. AGENTS (per-CLI comparison) ---
+    # Each tool's own ToolStats is still separate before the combined merge, so a
+    # side-by-side "which CLI am I living in / which is cheaper per session" view
+    # is a pure display aggregation. Grok cache-hit is — by construction — N/A.
+    if len(stats_list) > 1:
+        agents_table = Table(box=box.SIMPLE_HEAD, show_edge=False, padding=(0, 1), expand=True)
+        agents_table.add_column("Agent", style="bold", no_wrap=True)
+        agents_table.add_column("Cost", justify="right", no_wrap=True)
+        agents_table.add_column("%", justify="right", style="dim", no_wrap=True)
+        agents_table.add_column("Sessions", justify="right", no_wrap=True)
+        agents_table.add_column("$/Sess", justify="right", no_wrap=True)
+        agents_table.add_column("Messages", justify="right", no_wrap=True)
+        agents_table.add_column("Tokens", justify="right", no_wrap=True)
+        agents_table.add_column("Cache Hit", justify="right", no_wrap=True)
+        for s in sorted(stats_list, key=lambda s: s.total_cost, reverse=True):
+            tname = TOOL_NAMES.get(s.source, s.source.title())
+            cps = fmt_cost_styled(s.total_cost / s.total_sessions) if s.total_sessions else "—"
+            cr = s.total_tokens.cache_read_tokens
+            denom = cr + s.total_tokens.input_tokens
+            chit = f"{cr / denom * 100:.0f}%" if denom > 0 and cr > 0 else "—"
+            agents_table.add_row(
+                Text(tname, style=TOOL_COLORS.get(s.source, "grey62")),
+                Text.from_markup(fmt_cost_styled(s.total_cost)),
+                fmt_pct(s.total_cost, total_cost),
+                f"{s.total_sessions:,}",
+                Text.from_markup(cps) if s.total_sessions else cps,
+                f"{s.total_messages:,}",
+                fmt_tokens(s.total_tokens.total),
+                chit,
+            )
+        console.print(_section(agents_table, "Agents"))
+
+    # --- 5. TOOLS ---
+    # Per-tool-name call counts (Claude + Codex; Grok records only per-session
+    # tool presence, not call counts, so it is excluded to keep the metric a true
+    # call-count breakdown). Denominator is the sum of these counts, not
+    # total_tool_calls (which includes Grok), so the percentages are internally
+    # consistent.
+    if combined.tool_calls_by_name:
+        tools_sorted = sorted(combined.tool_calls_by_name.items(), key=lambda kv: (-kv[1], kv[0]))
+        tool_total = sum(c for _, c in tools_sorted)
+        TOP_N = 8
+        rows = tools_sorted[:TOP_N]
+        other = sum(c for _, c in tools_sorted[TOP_N:])
+        if other > 0:
+            rows = rows + [("other", other)]
+        TBAR = 16
+        tools_table = Table(box=None, show_header=False, show_edge=False, padding=(0, 1, 0, 0), expand=True)
+        tools_table.add_column("tool", style="bold", no_wrap=True)
+        tools_table.add_column("count", justify="right", no_wrap=True)
+        tools_table.add_column("bar", no_wrap=True)
+        tools_table.add_column("pct", justify="right", style="dim", no_wrap=True)
+        for name, cnt in rows:
+            pct = cnt / tool_total if tool_total else 0
+            filled = int(pct * TBAR)
+            bar = f"[#d7afd7]{'█' * filled}[/#d7afd7][bright_black]{'░' * (TBAR - filled)}[/bright_black]"
+            tools_table.add_row(name[:22], f"{cnt:,}", Text.from_markup(bar), fmt_pct(cnt, tool_total))
+        footnote = Text("Claude + Codex tool calls · % = share of named tool calls", style="dim")
+        console.print(_section(Group(tools_table, footnote), "Tools"))
+
+    # --- 5c. HEATMAP (weekday × hour message activity, local time) ---
+    if any(combined.heatmap):
+        DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        hmax = max(combined.heatmap) or 1
+        heat_tbl = Table(box=None, show_header=False, show_edge=False, padding=(0, 1, 0, 0), expand=False)
+        heat_tbl.add_column("d", style="bold", no_wrap=True)
+        heat_tbl.add_column("cells", no_wrap=True)
+        ruler = Text()
+        for h in range(24):
+            ruler.append("┊" if h % 6 == 0 else " ", style="grey42")
+        heat_tbl.add_row(Text(""), ruler)
+        # Shade ramp gives contrast even where color is unavailable; the gradient
+        # color reinforces it where it is.
+        HEAT_CHARS = " ░░▒▒▓▓█"
+        for wd in range(7):
+            cells = Text()
+            for h in range(24):
+                v = combined.heatmap[wd * 24 + h]
+                if v <= 0:
+                    cells.append("·", style="grey23")
+                else:
+                    # sqrt scale: a peaked distribution otherwise flattens every
+                    # non-peak hour to the lightest shade, hiding the focus windows.
+                    idx = min(7, max(1, int((v / hmax) ** 0.5 * 7)))
+                    cells.append(HEAT_CHARS[idx], style=SPARK_GRADIENT[idx])
+            heat_tbl.add_row(DOW[wd], cells)
+        heat_foot = Text("┊ = 0/6/12/18h local · brighter = busier", style="dim")
+        console.print(_section(Group(heat_tbl, heat_foot), "Heatmap"))
 
     # --- 6. MACHINES ---
     if per_machine and len(per_machine) > 1:
@@ -1065,7 +1274,18 @@ def print_stats(
             dur = fmt_duration(p.duration_ms) if p.duration_ms > 0 else "—"
             cph = fmt_cost_styled(p.cost / (p.duration_ms / 3_600_000)) if p.duration_ms > 0 else "—"
             proj_table.add_row(name, Text.from_markup(fmt_cost_styled(p.cost)), fmt_tokens(p.output_tokens), dur, Text.from_markup(cph) if p.duration_ms > 0 else cph)
-        console.print(_section(proj_table, "Projects (Top 10)"))
+        # Concentration footer over ALL projects (not just the top 10): top-3 cost
+        # share + Herfindahl index, so a power user sees whether spend is one repo
+        # or spread thin. HHI ranges 1/n (even) → 1 (single project).
+        all_costs = sorted((p.cost for p in projects_by_name.values() if p.cost > 0), reverse=True)
+        proj_total = sum(all_costs)
+        if proj_total > 0 and len(all_costs) > 1:
+            top3_share = sum(all_costs[:3]) / proj_total * 100
+            hhi = sum((c / proj_total) ** 2 for c in all_costs)
+            conc = Text(f"{len(all_costs)} projects · top 3 = {top3_share:.0f}% of cost · concentration {hhi:.2f}", style="dim")
+            console.print(_section(Group(proj_table, conc), "Projects (Top 10)"))
+        else:
+            console.print(_section(proj_table, "Projects (Top 10)"))
 
 
 # ---------------------------------------------------------------------------

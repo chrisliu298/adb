@@ -142,6 +142,9 @@ class _Aggregates:
     )
     daily: dict[date, DayActivity] = field(default_factory=dict)
     tool_calls_by_name: dict[str, int] = field(default_factory=dict)
+    heatmap: list = field(default_factory=lambda: [0] * 168)  # weekday*24+hour, local
+    model_first_seen: dict = field(default_factory=dict)      # model -> earliest ISO day
+    rl_by_day: dict = field(default_factory=dict)             # date -> max 5h used_percent
 
 
 def _parse_ts(ts: str | None) -> datetime | None:
@@ -220,6 +223,10 @@ def _parse_session_file(
                         d = _local_day(dt)
                         active_days.add(d)
                         agg.daily.setdefault(d, DayActivity(day=d))
+                        mday = d.isoformat()
+                        prev = agg.model_first_seen.get(str(model))
+                        if prev is None or mday < prev:
+                            agg.model_first_seen[str(model)] = mday
                     continue
 
                 if typ == "event_msg" and payload.get("type") == "token_count":
@@ -227,6 +234,18 @@ def _parse_session_file(
                     if rl and (sess_rl_at is None or dt > sess_rl_at):
                         sess_rl_at = dt
                         sess_rl = rl
+                    # Per-day max 5-Hour (primary) utilization for the history
+                    # sparkline. Only the main "codex" limit bucket, matching the
+                    # gauge selection in parse().
+                    if rl and rl.get("limit_id", "codex") in ("codex", "", None):
+                        prim = rl.get("primary") or {}
+                        try:
+                            pct = float(prim.get("used_percent", 0) or 0)
+                        except (TypeError, ValueError):
+                            pct = 0.0
+                        if pct > 0:
+                            d0 = _local_day(dt)
+                            agg.rl_by_day[d0] = max(agg.rl_by_day.get(d0, 0.0), pct)
                     if in_range:
                         active_days.add(_local_day(dt))
                     info = payload.get("info")
@@ -257,14 +276,17 @@ def _parse_session_file(
                             role = payload.get("role")
                             d = _local_day(dt)
                             active_days.add(d)
+                            lt = _to_local(dt)
                             if role == "user":
                                 user_messages += 1
                                 agg.daily.setdefault(d, DayActivity(day=d)).messages += 1
-                                agg.messages_by_hour[_to_local(dt).hour] += 1
+                                agg.messages_by_hour[lt.hour] += 1
+                                agg.heatmap[lt.weekday() * 24 + lt.hour] += 1
                             elif role == "assistant":
                                 assistant_messages += 1
                                 agg.daily.setdefault(d, DayActivity(day=d)).messages += 1
-                                agg.messages_by_hour[_to_local(dt).hour] += 1
+                                agg.messages_by_hour[lt.hour] += 1
+                                agg.heatmap[lt.weekday() * 24 + lt.hour] += 1
                         continue
     except OSError:
         return
@@ -588,7 +610,7 @@ def parse(
     base_hash = hashlib.md5("\x00".join(str(b.resolve()) for b in bases).encode()).hexdigest()[:12]
     if cache_dir is None:
         cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    cache_path = cache_dir / f"codex-sessions-v2-{base_hash}.json"
+    cache_path = cache_dir / f"codex-sessions-v4-{base_hash}.json"
     fp = _dir_fingerprint(files)
     cached = _load_codex_cache(cache_path)
     if cached and cached.get("fp") == fp:
@@ -714,6 +736,9 @@ def parse(
     # Projects
     projects = _build_projects(agg)
 
+    # Per-session cost distribution: one priced cost per deduped session.
+    session_costs = [c for c in (_session_cost(s) for s in agg.sessions) if c > 0]
+
     result = ToolStats(
         source="codex",
         total_tokens=total_tokens,
@@ -730,6 +755,11 @@ def parse(
         hour_counts=dict(agg.messages_by_hour),
         rate_limits=rate_limits,
         projects=projects,
+        tool_calls_by_name=dict(agg.tool_calls_by_name),
+        session_costs=session_costs,
+        heatmap=list(agg.heatmap),
+        model_first_seen=dict(agg.model_first_seen),
+        rate_limit_history={d.isoformat(): pct for d, pct in agg.rl_by_day.items()},
         longest_session_duration_ms=longest_dur_ms,
         longest_session_messages=longest_msgs,
         unpriced_models=unpriced_models,
@@ -738,6 +768,29 @@ def parse(
     )
     _save_codex_cache(cache_path, fp, result)
     return result
+
+
+def _session_cost(sess: _SessionSummary) -> float:
+    """Priced cost of a single session from its per-model token usage. Shared by
+    the projects rollup and the per-session cost distribution so both agree."""
+    cost = 0.0
+    for model, usage in sess.tokens_by_model.items():
+        pricing = _pricing_for(model)
+        if pricing is None:
+            continue
+        cached = max(0, min(usage.cached_input_tokens, usage.input_tokens))
+        non_cached = max(0, usage.input_tokens - cached)
+        cached_rate = (
+            pricing.input_usd_per_mtok
+            if pricing.cached_input_usd_per_mtok is None
+            else pricing.cached_input_usd_per_mtok
+        )
+        cost += (
+            non_cached * pricing.input_usd_per_mtok
+            + cached * cached_rate
+            + usage.output_tokens * pricing.output_usd_per_mtok
+        ) / 1e6
+    return cost
 
 
 def _build_projects(agg: _Aggregates) -> list[ProjectInfo]:
@@ -750,24 +803,7 @@ def _build_projects(agg: _Aggregates) -> list[ProjectInfo]:
 
     rows: list[ProjectInfo] = []
     for key, sess in last_by_key.items():
-        # Compute cost for this session
-        cost = 0.0
-        for model, usage in sess.tokens_by_model.items():
-            pricing = _pricing_for(model)
-            if pricing is None:
-                continue
-            cached = max(0, min(usage.cached_input_tokens, usage.input_tokens))
-            non_cached = max(0, usage.input_tokens - cached)
-            cached_rate = (
-                pricing.input_usd_per_mtok
-                if pricing.cached_input_usd_per_mtok is None
-                else pricing.cached_input_usd_per_mtok
-            )
-            cost += (
-                non_cached * pricing.input_usd_per_mtok
-                + cached * cached_rate
-                + usage.output_tokens * pricing.output_usd_per_mtok
-            ) / 1e6
+        cost = _session_cost(sess)
         if cost <= 0:
             continue
         shown = key.replace(str(Path.home()), "~")

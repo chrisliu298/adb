@@ -110,6 +110,8 @@ class _Aggregates:
         default_factory=lambda: {h: 0 for h in range(24)}
     )
     daily: dict[date, DayActivity] = field(default_factory=dict)
+    heatmap: list = field(default_factory=lambda: [0] * 168)  # weekday*24+hour, local
+    model_first_seen: dict = field(default_factory=dict)      # model -> earliest ISO day
 
 
 def _parse_ts(ts: str | None) -> datetime | None:
@@ -219,7 +221,13 @@ def _parse_session_dir(d: Path, agg: _Aggregates) -> None:
         da.messages += messages
         da.sessions += 1
         da.tool_calls += tool_calls
-        agg.messages_by_hour[started.astimezone().hour] += messages
+        lt = started.astimezone()
+        agg.messages_by_hour[lt.hour] += messages
+        agg.heatmap[lt.weekday() * 24 + lt.hour] += messages
+        mday = day.isoformat()
+        prev = agg.model_first_seen.get(model)
+        if prev is None or mday < prev:
+            agg.model_first_seen[model] = mday
 
 
 def _iter_session_dirs(sessions_dir: Path) -> list[Path]:
@@ -330,7 +338,7 @@ def parse(
     # RESOLVED, NUL-joined bases; v2 tag bumped on accounting changes (see codex).
     base_hash = hashlib.md5("\x00".join(str(b.resolve()) for b in bases).encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    cache_path = cache_dir / f"grok-sessions-v2-{base_hash}.json"
+    cache_path = cache_dir / f"grok-sessions-v3-{base_hash}.json"
     fp = _dir_fingerprint(dirs)
     cached = _load_cache(cache_path)
     if cached and cached.get("fp") == fp:
@@ -401,6 +409,8 @@ def parse(
         hour_counts=dict(agg.messages_by_hour),
         rate_limits=[],
         projects=_build_projects(agg),
+        heatmap=list(agg.heatmap),
+        model_first_seen=dict(agg.model_first_seen),
         longest_session_duration_ms=longest_dur_ms,
         longest_session_messages=longest_msgs,
         unpriced_models=unpriced_models,

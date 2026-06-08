@@ -126,6 +126,19 @@ class ProjectInfo:
         self.duration_ms += other.duration_ms
 
 
+def _pad_heatmap(vals) -> list[int]:
+    """Normalize a deserialized heatmap to exactly 168 ints (defensive against an
+    absent or malformed cached value)."""
+    out = [0] * 168
+    if isinstance(vals, list):
+        for i, v in enumerate(vals[:168]):
+            try:
+                out[i] = int(v)
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
 @dataclass
 class ToolStats:
     """Unified stats from a single tool (Claude or Codex)."""
@@ -150,6 +163,28 @@ class ToolStats:
 
     rate_limits: list[RateLimitInfo] = field(default_factory=list)
     projects: list[ProjectInfo] = field(default_factory=list)
+
+    # Per-tool-name invocation counts (Claude: Bash/Edit/Read/…, Codex: exec_command/
+    # apply_patch/…). Grok records only an aggregate tool-call count (no per-name
+    # data), so it is not represented here. Raw tool names, deduped per source the
+    # same way tool_calls is; merged across machines by summing per key.
+    tool_calls_by_name: dict[str, int] = field(default_factory=dict)
+
+    # Per-session $ costs (Codex: one per session_meta.id; Claude: one per session
+    # transcript file). Retained so the dashboard can show the spend *distribution*
+    # — the top-1%-of-sessions concentration — not just the average. Merged across
+    # machines by concatenation; rounded to cents to stay compact.
+    session_costs: list[float] = field(default_factory=list)
+
+    # weekday*24 + hour -> message count, local time (activity heatmap).
+    heatmap: list[int] = field(default_factory=lambda: [0] * 168)
+    # stop_reason -> count (Claude only: end_turn/tool_use/max_tokens/refusal/…).
+    stop_reasons: dict[str, int] = field(default_factory=dict)
+    # model id -> earliest ISO day it was seen (model-adoption timeline).
+    model_first_seen: dict[str, str] = field(default_factory=dict)
+    # ISO day -> max Codex 5-Hour rate-limit utilization seen that day (history for a
+    # utilization sparkline; Claude rate limits are live-only, so no history exists).
+    rate_limit_history: dict[str, float] = field(default_factory=dict)
 
     longest_session_duration_ms: int = 0
     longest_session_messages: int = 0
@@ -230,6 +265,12 @@ class ToolStats:
                 }
                 for p in self.projects
             ],
+            "tool_calls_by_name": self.tool_calls_by_name,
+            "session_costs": [round(c, 2) for c in self.session_costs],
+            "heatmap": self.heatmap,
+            "stop_reasons": self.stop_reasons,
+            "model_first_seen": self.model_first_seen,
+            "rate_limit_history": self.rate_limit_history,
             "longest_session_duration_ms": self.longest_session_duration_ms,
             "longest_session_messages": self.longest_session_messages,
             "unpriced_models": list(self.unpriced_models),
@@ -303,6 +344,12 @@ class ToolStats:
                 )
                 for p in data.get("projects", [])
             ],
+            tool_calls_by_name=dict(data.get("tool_calls_by_name", {})),
+            session_costs=list(data.get("session_costs", [])),
+            heatmap=_pad_heatmap(data.get("heatmap", [])),
+            stop_reasons=dict(data.get("stop_reasons", {})),
+            model_first_seen=dict(data.get("model_first_seen", {})),
+            rate_limit_history=dict(data.get("rate_limit_history", {})),
             longest_session_duration_ms=data.get("longest_session_duration_ms", 0),
             longest_session_messages=data.get("longest_session_messages", 0),
             unpriced_models=set(data.get("unpriced_models", [])),
