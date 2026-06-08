@@ -24,7 +24,7 @@ sync_host() {
     local host="$1"
     local dest="$CACHE_DIR/$host"
     echo "Syncing $host..."
-    mkdir -p "$dest/claude" "$dest/codex" "$dest/grok"
+    mkdir -p "$dest/claude" "$dest/codex/sessions" "$dest/codex/archived_sessions" "$dest/grok"
 
     rsync -az --timeout=10 -e "$RSH" \
         "$host:.claude/stats-cache.json" \
@@ -56,10 +56,14 @@ sync_host() {
     # remote stay counted (the total is cumulative/lifetime). Stale-rollout
     # double-counting is handled at the parser level by session_meta.id dedup
     # (parser/parsers/codex.py _dedup_files_by_session), so pruning isn't needed.
-    # The shadow homes below merge into this same dir; dedup collapses overlaps.
+    # The archived sibling and shadow homes below are separate subtrees; dedup
+    # collapses overlaps.
     rsync -az --timeout=10 -e "$RSH" \
         "$host:.codex/sessions/" \
         "$dest/codex/sessions/" 2>/dev/null || true
+    rsync -az --timeout=10 -e "$RSH" \
+        "$host:.codex/archived_sessions/" \
+        "$dest/codex/archived_sessions/" 2>/dev/null || true
 
     # Some tools run Codex against a shadow CODEX_HOME (e.g. task-synth uses
     # ~/.task-synth-codex, taskforge uses ~/.codex-taskforge) so their rollouts
@@ -69,6 +73,9 @@ sync_host() {
         rsync -az --timeout=10 -e "$RSH" \
             "$host:$ch/sessions/" \
             "$dest/codex/sessions/" 2>/dev/null || true
+        rsync -az --timeout=10 -e "$RSH" \
+            "$host:$ch/archived_sessions/" \
+            "$dest/codex/archived_sessions/${ch#.}/" 2>/dev/null || true
     done
 
     # Grok Build CLI: one self-contained dir per session. NO --delete — this

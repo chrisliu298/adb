@@ -1,4 +1,4 @@
-"""Parse Codex CLI stats from ~/.codex/sessions/**/*.jsonl."""
+"""Parse Codex CLI stats from Codex session JSONL trees."""
 
 from __future__ import annotations
 
@@ -23,6 +23,14 @@ from parser.types import (
 DATE_SUFFIX_RE = re.compile(r"^(?P<base>.+)-\d{4}-\d{2}-\d{2}$")
 
 SESSIONS_DIR = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions"
+ARCHIVED_SESSIONS_DIR_NAME = "archived_sessions"
+
+
+def _default_sessions_dirs(sessions_dir: Path) -> list[Path]:
+    bases = [sessions_dir]
+    if sessions_dir.name == "sessions":
+        bases.append(sessions_dir.parent / ARCHIVED_SESSIONS_DIR_NAME)
+    return bases
 
 
 @dataclass(frozen=True, slots=True)
@@ -538,17 +546,18 @@ def parse(
     *,
     sessions_dir: Path = SESSIONS_DIR,
     sessions_dirs: list[Path] | None = None,
+    cache_dir: Path | None = None,
 ) -> ToolStats | None:
     """Parse Codex CLI session logs. Returns None if no data available.
 
-    sessions_dirs: optional list of base dirs to read together — e.g. a remote
-    host's rsync mirror plus its .remote-<host> recall-sync staging dir, which
-    preserves sessions rotated off the remote. Sessions that appear in more than
-    one base are collapsed by session_meta.id, so the staging copy of a rotated
-    session is recovered without double-counting the mirror. When omitted, reads
-    the single sessions_dir (the local CODEX_HOME default).
+    sessions_dirs: optional list of base dirs to read together, such as a
+    durable data bucket plus live active/archived session directories. Sessions
+    that appear in more than one base are collapsed by session_meta.id, so
+    archived or staged copies are recovered without double-counting the active
+    copy. When omitted, reads sessions_dir plus its archived_sessions sibling
+    for the default CODEX_HOME layout.
     """
-    bases = sessions_dirs if sessions_dirs is not None else [sessions_dir]
+    bases = sessions_dirs if sessions_dirs is not None else _default_sessions_dirs(sessions_dir)
     bases = [b for b in bases if b.exists()]
     if not bases:
         return None
@@ -577,7 +586,8 @@ def parse(
     # is bumped whenever the accounting/dedup logic changes, so a stale whole-result
     # cache written under older logic is never served (Claude does this via tokens3).
     base_hash = hashlib.md5("\x00".join(str(b.resolve()) for b in bases).encode()).hexdigest()[:12]
-    cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
+    if cache_dir is None:
+        cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
     cache_path = cache_dir / f"codex-sessions-v2-{base_hash}.json"
     fp = _dir_fingerprint(files)
     cached = _load_codex_cache(cache_path)

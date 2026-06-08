@@ -33,6 +33,12 @@ REPO_DIR = Path(__file__).resolve().parent
 REMOTE_CACHE = REPO_DIR / ".cache" / "remotes"
 DATA_DIR = REPO_DIR / "data"  # in-repo append-only source of truth (gitignored)
 REMOTES_CONF = REPO_DIR / "remotes.conf"
+CODEX_SESSION_DIR_NAMES = ("sessions", "archived_sessions")
+
+
+def _local_codex_session_dirs() -> list[Path]:
+    codex_home = Path.home() / ".codex"
+    return [codex_home / name for name in CODEX_SESSION_DIR_NAMES]
 
 
 def _load_remote_hosts() -> list[str]:
@@ -147,15 +153,34 @@ def _sync_remotes() -> None:
     subprocess.run([str(SYNC_SCRIPT)], cwd=str(REPO_DIR))
 
 
+def _cache_path_mtime(path: Path) -> float | None:
+    if path.is_file():
+        return path.stat().st_mtime
+    if not path.is_dir():
+        return None
+    mtimes: list[float] = []
+    for child in path.rglob("*"):
+        if child.is_file():
+            mtimes.append(child.stat().st_mtime)
+    return max(mtimes) if mtimes else None
+
+
 def _remote_cache_age_hours(hosts: list[str]) -> float | None:
     """Hours since the newest sync-touched file across hosts. None if no cache."""
     mtimes: list[float] = []
     for host in hosts:
         base = REMOTE_CACHE / host
-        for rel in ("claude/history.jsonl", "claude/stats-cache.json", "codex/sessions", "grok/sessions"):
+        for rel in (
+            "claude/history.jsonl",
+            "claude/stats-cache.json",
+            "codex/sessions",
+            "codex/archived_sessions",
+            "grok/sessions",
+        ):
             p = base / rel
-            if p.exists():
-                mtimes.append(p.stat().st_mtime)
+            mtime = _cache_path_mtime(p)
+            if mtime is not None:
+                mtimes.append(mtime)
     if not mtimes:
         return None
     return (time.time() - max(mtimes)) / 3600
@@ -186,7 +211,7 @@ def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[Too
     ])
     local_xk = dict(sessions_dirs=[
         DATA_DIR / "codex" / "local",
-        Path.home() / ".codex" / "sessions",  # live overlay
+        *_local_codex_session_dirs(),  # live overlays
     ])
     local_gk = dict(sessions_dirs=[
         DATA_DIR / "grok" / "local",
@@ -219,7 +244,7 @@ def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[Too
 
     for host in include_remotes:
         # Read each remote's tokens from the in-repo durable store only. The store
-        # already folds the rsync mirror + .remote-<host> staging + recovery archive
+        # already folds the rsync mirror, archived sessions, and recovery archive
         # into one append-only bucket per host (ingest.sh), so there is nothing to
         # combine here and nothing the live sources can silently delete out from
         # under the lifetime total.

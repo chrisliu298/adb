@@ -38,10 +38,8 @@ def _write_session(path: Path, session_id: str, *, inp: int, out: int) -> None:
 
 
 def _total(*dirs: Path) -> int:
-    # Force a cold parse each call so we measure the parse, not a warm cache.
-    for c in (Path(__file__).resolve().parent.parent / ".cache").glob("codex-sessions-*.json"):
-        c.unlink()
-    ts = codex_parser.parse(sessions_dirs=list(dirs))
+    cache_dir = dirs[0].parent / ".codex-parser-cache"
+    ts = codex_parser.parse(sessions_dirs=list(dirs), cache_dir=cache_dir)
     return ts.total_tokens.total if ts else 0
 
 
@@ -70,8 +68,24 @@ def test_codex_rotation_recovery(tmp_path) -> None:
     run(tmp_path)
 
 
+def test_codex_archived_sessions_count_and_dedup(tmp_path) -> None:
+    live = tmp_path / "sessions"
+    archived = tmp_path / "archived_sessions"
+
+    _write_session(live / "active.jsonl", "sess-active", inp=1000, out=500)
+    _write_session(live / "dupe.jsonl", "sess-dupe", inp=200, out=100)
+    _write_session(archived / "dupe.jsonl", "sess-dupe", inp=200, out=100)
+    _write_session(archived / "archived.jsonl", "sess-archived", inp=3000, out=700)
+
+    total = _total(live, archived)
+    # active (1500) + duplicate once (300) + archived-only (3700)
+    assert total == 5500, f"expected archived sessions to count once, got {total}"
+
+
 if __name__ == "__main__":
     import tempfile
 
     with tempfile.TemporaryDirectory() as d:
-        run(Path(d))
+        tmp = Path(d)
+        run(tmp)
+        test_codex_archived_sessions_count_and_dedup(tmp / "archived-case")

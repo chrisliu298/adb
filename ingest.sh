@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Ingest every session adb counts — Claude / Codex / Grok, local + each remote
-# (rsync mirror + .remote-<host> staging) + the one-time Time Machine recovery
+# Ingest every session adb counts — Claude / Codex / Grok, local homes, each
+# remote rsync mirror, Codex archived sessions, and the one-time Time Machine recovery
 # archive — into the in-repo append-only source of truth at data/.
 #
 # NEVER-SHRINK: append-only session JSONL (Claude/Codex) is copied with
@@ -58,8 +58,10 @@ done
 
 # ---- Codex ----
 addj "$HOME/.codex/sessions"  "$DATA/codex/local"  --exclude='.remote-*'
+addj "$HOME/.codex/archived_sessions"  "$DATA/codex/local/archived_sessions"
 for h in $HOSTS; do
-    addj "$CACHE/$h/codex/sessions"         "$DATA/codex/$h"
+    addj "$CACHE/$h/codex/sessions"            "$DATA/codex/$h"
+    addj "$CACHE/$h/codex/archived_sessions"  "$DATA/codex/$h/archived_sessions"
 done
 
 # ---- Grok ----  (signals.json is rewritten, not append-only -> plain copy)

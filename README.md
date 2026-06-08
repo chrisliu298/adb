@@ -64,8 +64,7 @@
 ```bash
 git clone https://github.com/chrisliu298/adb.git
 cd adb
-uv venv && source .venv/bin/activate
-uv pip install -e .
+uv sync
 ```
 
 ## 2. Usage
@@ -73,9 +72,9 @@ uv pip install -e .
 **Run to print terminal stats.**
 
 ```bash
-adb                              # all machines (local + remotes)
-adb local                        # local machine only
-adb local server1                # local + specific remotes
+uv run adb                       # all machines (local + remotes)
+uv run adb local                 # local machine only
+uv run adb local server1         # local + specific remotes
 ```
 
 ## 3. Multi-Machine Setup
@@ -93,7 +92,8 @@ adb local server1                # local + specific remotes
                             │  │   ├── .claude.json        │
                             │  │   └── projects/           │
                             │  └── codex/                  │
-                            │      └── sessions/           │
+                            │      ├── sessions/           │
+                            │      └── archived_sessions/  │
                             └──────────────────────────────┘
 ```
 
@@ -103,7 +103,7 @@ adb local server1                # local + specific remotes
    # edit remotes.conf with your hosts
    ```
 2. Run `./sync.sh` to pull usage data from all remotes
-3. Run `python adb.py` — remote data is automatically included
+3. Run `uv run python adb.py` — remote data is automatically included
 
 ## 4. Output Sections
 
@@ -127,7 +127,7 @@ Rate limit utilization (Claude and Codex) is shown in the header when available.
 - `~/.claude/stats-cache.json` — daily activity, model usage, session counts
 - `~/.claude/history.jsonl` — session timestamps (streak fallback)
 - `~/.claude/projects/*/` — session conversation logs (per-project cost computation)
-- `~/.codex/sessions/` — Codex session files
+- `~/.codex/sessions/` and `~/.codex/archived_sessions/` — Codex session files
 - Anthropic OAuth API — rate limit utilization (optional, auto-detected from macOS Keychain)
 
 ## 6. Project Structure
