@@ -303,7 +303,10 @@ def _build_projects(agg: _Aggregates) -> list[ProjectInfo]:
 
     rows = [p for p in by_key.values() if p.cost > 0]
     rows.sort(key=lambda p: p.cost, reverse=True)
-    return rows[:10]
+    # Return all projects: the dashboard does the cross-machine merge + top-N, so
+    # truncating here would drop the long tail before the merge (per the
+    # per-project rollup invariant in CLAUDE.md). Mirrors the Claude/Codex parsers.
+    return rows
 
 
 def parse(
@@ -339,7 +342,7 @@ def parse(
     # RESOLVED, NUL-joined bases; v2 tag bumped on accounting changes (see codex).
     base_hash = hashlib.md5("\x00".join(str(b.resolve()) for b in bases).encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    cache_path = cache_dir / f"grok-sessions-v5-{base_hash}.json"
+    cache_path = cache_dir / f"grok-sessions-v6-{base_hash}.json"
     fp = _dir_fingerprint(dirs)
     cached = _load_cache(cache_path)
     if cached and cached.get("fp") == fp:

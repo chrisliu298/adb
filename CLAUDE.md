@@ -56,6 +56,7 @@ Python 3.10+. Runtime dependencies: `httpx`, `orjson`, `rich`. Dev dependency: `
 - **Codex:** Token snapshots are cumulative counters; the parser computes deltas between consecutive snapshots, handling counter resets. Model names are normalized before pricing lookup.
 - **Grok:** No input/output/cache breakdown exists in the data, so cost is a *notional* estimate: per-session `contextTokensUsed` × the model's full input rate (the most defensible single number). `grok-build` is tiered by context size (≤200K → $1/M, >200K → $2/M), applied per session. `grok-composer-2.5-fast` has no public xAI per-token rate — it's priced with the Cursor Composer 2.5 "fast" tier ($3/$15) as a proxy. Output and cache are always 0 (not recorded), so Grok cost is a lower bound for multi-call agentic sessions.
 - **Recent section:** Estimates cost by multiplying output tokens by a global cost-per-output-token ratio (total_cost / total_output_tokens), not by re-pricing each model.
+- **Per-project rollup invariant:** Every parser's project rollup (`_build_projects` / `_load_projects_from_sessions`) must be *cumulative across all sessions* sharing a repo/cwd and return all projects (the dashboard does the cross-machine merge + top-N). A per-session or per-bucket-truncated rollup silently undercounts the shared Projects panel. Match this when adding a new agent's project support.
 
 ### Performance
 

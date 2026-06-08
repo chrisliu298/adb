@@ -632,7 +632,7 @@ def parse(
     base_hash = hashlib.md5("\x00".join(str(b.resolve()) for b in bases).encode()).hexdigest()[:12]
     if cache_dir is None:
         cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    cache_path = cache_dir / f"codex-sessions-v6-{base_hash}.json"
+    cache_path = cache_dir / f"codex-sessions-v7-{base_hash}.json"
     fp = _dir_fingerprint(files)
     cached = _load_codex_cache(cache_path)
     if cached and cached.get("fp") == fp:
@@ -817,39 +817,24 @@ def _session_cost(sess: _SessionSummary) -> float:
 
 
 def _build_projects(agg: _Aggregates) -> list[ProjectInfo]:
-    last_by_key: dict[str, _SessionSummary] = {}
+    """Cumulative per-project rollup: cost/tokens/duration summed across EVERY
+    session sharing a repo/cwd, mirroring the Claude parser. Keyed by repo_url,
+    falling back to cwd, then "unknown". Returns all projects (the dashboard does
+    its own cross-machine merge and top-N), so the long tail is not dropped here."""
+    by_key: dict[str, ProjectInfo] = {}
     for s in agg.sessions:
         key = s.repo_url or s.cwd or "unknown"
-        prev = last_by_key.get(key)
-        if prev is None or _stamp(s) > _stamp(prev):
-            last_by_key[key] = s
-
-    rows: list[ProjectInfo] = []
-    for key, sess in last_by_key.items():
-        cost = _session_cost(sess)
-        if cost <= 0:
-            continue
-        shown = key.replace(str(Path.home()), "~")
-        dur_ms = 0
-        if sess.started_at and sess.ended_at:
-            dur_ms = int((sess.ended_at - sess.started_at).total_seconds() * 1000)
-        rows.append(
-            ProjectInfo(
-                path=shown,
-                cost=cost,
-                input_tokens=sess.tokens.input_tokens,
-                output_tokens=sess.tokens.output_tokens,
-                duration_ms=dur_ms,
+        row = by_key.get(key)
+        if row is None:
+            row = by_key[key] = ProjectInfo(
+                path=key.replace(str(Path.home()), "~"), cost=0.0
             )
-        )
+        row.cost += _session_cost(s)
+        row.input_tokens += s.tokens.input_tokens
+        row.output_tokens += s.tokens.output_tokens
+        if s.started_at and s.ended_at:
+            row.duration_ms += int((s.ended_at - s.started_at).total_seconds() * 1000)
 
+    rows = [r for r in by_key.values() if r.cost > 0]
     rows.sort(key=lambda x: x.cost, reverse=True)
-    return rows[:10]
-
-
-def _stamp(s: _SessionSummary) -> datetime:
-    if s.ended_at is not None:
-        return s.ended_at
-    if s.started_at is not None:
-        return s.started_at
-    return datetime.min.replace(tzinfo=UTC)
+    return rows
