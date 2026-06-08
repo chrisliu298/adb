@@ -132,6 +132,7 @@ def _merge_two(a: ToolStats, b: ToolStats) -> ToolStats:
         projects=projects,
         tool_calls_by_name=tool_calls_by_name,
         session_costs=a.session_costs + b.session_costs,
+        session_tokens=a.session_tokens + b.session_tokens,
         heatmap=heatmap,
         stop_reasons=stop_reasons,
         model_first_seen=model_first_seen,
@@ -1185,6 +1186,20 @@ def print_stats(
 
         act.add_row("Avg Sess", " · ".join(sess_parts))
 
+    # Per-session token distribution: the average alone hides a runaway. The
+    # heaviest single session vs the average is the at-a-glance signal that one
+    # session (thousands of full-context turns) blew up the token total — and it's
+    # token-native, so a cheap-but-huge cache-heavy Codex session still surfaces.
+    sess_toks = combined.session_tokens
+    if sess_toks and total_sessions > 0:
+        avg_tok = total_tokens / total_sessions
+        max_tok = max(sess_toks)
+        mult = f" ([{ACCENT}]{max_tok / avg_tok:.0f}×[/{ACCENT}])" if avg_tok > 0 else ""
+        act.add_row(
+            "Tok/Sess",
+            Text.from_markup(f"{fmt_tokens(int(avg_tok))} avg · {fmt_tokens(max_tok)} max{mult}"),
+        )
+
     density_parts = []
     if total_messages > 0:
         density_parts.append(f"{total_tool_calls / total_messages:,.1f} tools/msg")
@@ -1350,43 +1365,66 @@ def print_stats(
         # color reinforces it where it is.
         HEAT_CHARS = " ░░▒▒▓▓█"
 
-        def _heat_cells(values, vmax) -> Text:
+        def _cell_widths(budget: int) -> list[int]:
+            """Per-hour cell widths summing to exactly `budget`, with the remainder
+            spread evenly across the 24 hours so the grid fills its container with no
+            right-side gap. Falls back to all-1 (the bare grid) when there's no room."""
+            if budget < 24:
+                return [1] * 24
+            base, rem = divmod(budget, 24)
+            # +1 on `rem` evenly-spaced cells (the classic Bresenham spread).
+            return [base + (1 if (h * rem) // 24 != ((h + 1) * rem) // 24 else 0) for h in range(24)]
+
+        def _heat_cells(values, vmax, widths) -> Text:
             # sqrt scale: a peaked distribution otherwise flattens every non-peak
             # cell to the lightest shade, hiding the focus windows.
             t = Text()
-            for v in values:
+            for v, w in zip(values, widths):
                 if v <= 0:
-                    t.append("·", style="grey23")
+                    t.append("·" * w, style="grey23")
                 else:
                     idx = min(7, max(1, int((v / vmax) ** 0.5 * 7)))
-                    t.append(HEAT_CHARS[idx], style=SPARK_GRADIENT[idx])
+                    t.append(HEAT_CHARS[idx] * w, style=SPARK_GRADIENT[idx])
             return t
 
-        heat_tbl = Table(box=None, show_header=False, show_edge=False, padding=(0, 1, 0, 0), expand=False)
-        heat_tbl.add_column("d", style="bold", no_wrap=True)
-        heat_tbl.add_column("cells", no_wrap=True)
-        heat_tbl.add_column("tot", justify="right", style="dim", no_wrap=True)  # per-row magnitude
-        ruler = Text()
-        for h in range(24):
-            ruler.append("┊" if h % 6 == 0 else " ", style="grey42")
-        heat_tbl.add_row(Text(""), ruler, Text(""))
-        for wd in range(7):
-            day = combined.heatmap[wd * 24:wd * 24 + 24]
-            heat_tbl.add_row(DOW[wd], _heat_cells(day, hmax), fmt_tokens(sum(day)))
-        # Σ row: the hour-of-day marginal (column sums of the grid above), on its own
-        # scale so the 7×-larger totals don't saturate. Adds the "which hours overall"
-        # read the per-day grid can't give, and lifts the body to match Tools' height
-        # so the pairing helper's blank padding line disappears.
-        hour_marg = [sum(combined.heatmap[wd * 24 + h] for wd in range(7)) for h in range(24)]
-        heat_tbl.add_row(Text("Σ", style="bold"), _heat_cells(hour_marg, max(hour_marg) or 1), fmt_tokens(sum(hour_marg)))
-        # Hour axis: place the labels directly under their ┊ ticks instead of a legend.
-        hour_lbl = [" "] * 24
-        for h in range(0, 24, 6):
-            for j, ch in enumerate(str(h)):
-                if h + j < 24:
-                    hour_lbl[h + j] = ch
-        heat_tbl.add_row(Text(""), Text("".join(hour_lbl), style="grey42"), Text(""))
-        heat_body = heat_tbl
+        def _build_heat(widths: list[int]) -> Table:
+            total_w = sum(widths)
+            offs = [sum(widths[:h]) for h in range(24)]  # start col of each hour's cell
+            heat_tbl = Table(box=None, show_header=False, show_edge=False, padding=(0, 1, 0, 0), expand=False)
+            heat_tbl.add_column("d", style="bold", no_wrap=True)
+            heat_tbl.add_column("cells", no_wrap=True)
+            heat_tbl.add_column("tot", justify="right", style="dim", no_wrap=True)  # per-row magnitude
+            # Ruler ticks + hour labels sit at each cell's start so they track the
+            # variable cell widths instead of a fixed 1-col-per-hour assumption.
+            ruler = [" "] * total_w
+            hour_lbl = [" "] * total_w
+            for h in range(0, 24, 6):
+                ruler[offs[h]] = "┊"
+                for j, ch in enumerate(str(h)):
+                    if offs[h] + j < total_w:
+                        hour_lbl[offs[h] + j] = ch
+            heat_tbl.add_row(Text(""), Text("".join(ruler), style="grey42"), Text(""))
+            for wd in range(7):
+                day = combined.heatmap[wd * 24:wd * 24 + 24]
+                heat_tbl.add_row(DOW[wd], _heat_cells(day, hmax, widths), fmt_tokens(sum(day)))
+            # Σ row: the hour-of-day marginal (column sums of the grid above), on its own
+            # scale so the 7×-larger totals don't saturate. Adds the "which hours overall"
+            # read the per-day grid can't give, and lifts the body to match Tools' height
+            # so the pairing helper's blank padding line disappears.
+            hour_marg = [sum(combined.heatmap[wd * 24 + h] for wd in range(7)) for h in range(24)]
+            heat_tbl.add_row(Text("Σ", style="bold"), _heat_cells(hour_marg, max(hour_marg) or 1, widths), fmt_tokens(sum(hour_marg)))
+            heat_tbl.add_row(Text(""), Text("".join(hour_lbl), style="grey42"), Text(""))
+            return heat_tbl
+
+        # Stretch the 24-col grid to fill its container instead of leaving dead space
+        # on the right. Mirrors the Tools bar's fill math: the heatmap is the ratio-2
+        # half of the 3:2 pair, or full width when stacked (< PAIR_MIN_WIDTH) or solo
+        # (no Tools). The cell budget is the container inner width minus the day-label
+        # and row-total columns (and a safety margin); _cell_widths spreads it so any
+        # width fills exactly, not just widths near a multiple of 24.
+        _heat_paired = tools_body is not None and width >= PAIR_MIN_WIDTH
+        _heat_inner = (round(width * 2 / 5) if _heat_paired else width) - 4
+        heat_body = _build_heat(_cell_widths(_heat_inner - 4 - 5 - 1))  # − day label, row total, safety
 
     # Tools needs the width (long names + bars); the heatmap is a fixed 24-col grid,
     # so a 3:2 split fits both. If only one has data, render it full-width.

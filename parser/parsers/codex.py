@@ -632,7 +632,7 @@ def parse(
     base_hash = hashlib.md5("\x00".join(str(b.resolve()) for b in bases).encode()).hexdigest()[:12]
     if cache_dir is None:
         cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    cache_path = cache_dir / f"codex-sessions-v5-{base_hash}.json"
+    cache_path = cache_dir / f"codex-sessions-v6-{base_hash}.json"
     fp = _dir_fingerprint(files)
     cached = _load_codex_cache(cache_path)
     if cached and cached.get("fp") == fp:
@@ -753,6 +753,13 @@ def parse(
 
     # Per-session cost distribution: one priced cost per deduped session.
     session_costs = [c for c in (_session_cost(s) for s in agg.sessions) if c > 0]
+    # Per-session total tokens (input incl. cached + output, matching the unified
+    # TokenBreakdown.total convention) so the dashboard can flag a runaway session.
+    session_tokens = [
+        t
+        for t in (s.tokens.input_tokens + s.tokens.output_tokens for s in agg.sessions)
+        if t > 0
+    ]
 
     result = ToolStats(
         source="codex",
@@ -772,6 +779,7 @@ def parse(
         projects=projects,
         tool_calls_by_name=dict(agg.tool_calls_by_name),
         session_costs=session_costs,
+        session_tokens=session_tokens,
         heatmap=list(agg.heatmap),
         model_first_seen=dict(agg.model_first_seen),
         rate_limit_history={d.isoformat(): pct for d, pct in agg.rl_by_day.items()},

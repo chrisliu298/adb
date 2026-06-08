@@ -310,8 +310,11 @@ _IDLE_GAP_S = 30 * 60  # 30 minutes — anything longer is treated as user idle
 
 def _parse_one_session_file(
     jsonl_file: Path,
-) -> tuple[str | None, float, int, set[str], int]:
-    """Parse a single JSONL file, return (cwd, cost, output_tokens, seen_ids, duration_ms).
+) -> tuple[str | None, float, int, set[str], int, int]:
+    """Parse a single JSONL file, return (cwd, cost, output_tokens, seen_ids, duration_ms, total_tokens).
+
+    total_tokens is the session's full token volume (input + output + cache read +
+    cache write), used for the per-session token distribution.
 
     For each unique msg.id, picks the most informative variant: a terminal
     stop_reason beats None, and among ties the entry with the largest
@@ -379,12 +382,19 @@ def _parse_one_session_file(
 
     cost = 0.0
     output_tokens = 0
+    total_tokens = 0
     for model, u, _ in msgs.values():
         pk = _pkey(model)
         if not pk or pk not in PRICE:
             continue
         cost += _msg_cost(model, u)
         output_tokens += u.get("output_tokens", 0)
+        total_tokens += (
+            (u.get("input_tokens", 0) or 0)
+            + (u.get("output_tokens", 0) or 0)
+            + (u.get("cache_read_input_tokens", 0) or 0)
+            + (u.get("cache_creation_input_tokens", 0) or 0)
+        )
 
     duration_ms = 0
     if len(timestamps) >= 2:
@@ -395,7 +405,7 @@ def _parse_one_session_file(
             if 0 < delta < _IDLE_GAP_S:
                 active_s += delta
         duration_ms = int(active_s * 1000)
-    return cwd, cost, output_tokens, set(msgs.keys()), duration_ms
+    return cwd, cost, output_tokens, set(msgs.keys()), duration_ms, total_tokens
 
 
 def _load_cache(cache_path: Path) -> dict:
@@ -415,16 +425,19 @@ def _save_cache(cache_path: Path, cache: dict) -> None:
         pass
 
 
-def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
+def _load_projects_from_sessions(
+    projects_base,
+) -> tuple[list[ProjectInfo], list[float], list[int]]:
     """Compute cumulative per-project costs from session conversation logs.
 
-    Accepts a Path or a list of Paths. Uses an incremental file-level cache
-    keyed by (size, mtime_ns) to avoid re-parsing unchanged files.
+    Returns (projects, session_costs, session_tokens). Accepts a Path or a list of
+    Paths. Uses an incremental file-level cache keyed by (size, mtime_ns) to avoid
+    re-parsing unchanged files.
     """
     bases = [projects_base] if isinstance(projects_base, Path) else list(projects_base)
     bases = [b for b in bases if b.exists()]
     if not bases:
-        return []
+        return [], [], []
 
     # Store cache in repo's .cache dir, not inside ~/.claude/projects/
     # v3: per-mid dedup picks largest-output variant (no stop_reason filter)
@@ -433,7 +446,8 @@ def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
     base_key = "|".join(str(b) for b in bases)
     base_hash = hashlib.md5(base_key.encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    cache_path = cache_dir / f"claude-projects3-{base_hash}.json"
+    # v4: per-file cache now also stores per-session total tokens ("t").
+    cache_path = cache_dir / f"claude-projects4-{base_hash}.json"
     cache = _load_cache(cache_path)
     cache_dirty = False
 
@@ -446,6 +460,9 @@ def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
     # Per-transcript costs for the session-cost distribution: the same effective
     # (dedup-adjusted) cost that lands in project_costs, one entry per session file.
     session_costs: list[float] = []
+    # Per-transcript total tokens, dedup-adjusted the same way, for the per-session
+    # token distribution (Tok/Sess avg-vs-max runaway signal).
+    session_tokens: list[int] = []
 
     for proj_key, proj_dir in _iter_project_dirs(bases):
         for jsonl_file in _iter_session_files(proj_dir):
@@ -463,6 +480,7 @@ def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
                 out = cached.get("o", 0)
                 cwd = cached.get("w")
                 dur = cached.get("d", 0)
+                tok = cached.get("t", 0)
                 file_ids = cached.get("ids", [])
                 if cost > 0:
                     # Check for ID collisions with already-seen IDs
@@ -473,6 +491,8 @@ def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
                         project_output[proj_key] += out
                         seen_ids.update(file_ids)
                         session_costs.append(cost)
+                        if tok > 0:
+                            session_tokens.append(tok)
                     else:
                         # Some IDs already seen; must re-derive cost
                         # This is rare (subagent files sharing message IDs)
@@ -483,12 +503,14 @@ def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
                             project_costs[proj_key] += cost * ratio
                             project_output[proj_key] += int(out * ratio)
                             session_costs.append(cost * ratio)
+                            if tok > 0:
+                                session_tokens.append(int(tok * ratio))
                 project_duration[proj_key] += dur
                 if cwd and proj_key not in project_paths:
                     project_paths[proj_key] = cwd
             else:
                 # Cache miss — parse file
-                cwd, cost, out, file_ids, dur = _parse_one_session_file(jsonl_file)
+                cwd, cost, out, file_ids, dur, tok = _parse_one_session_file(jsonl_file)
                 # Deduplicate IDs against global seen set
                 new_ids = file_ids - seen_ids
                 if len(new_ids) < len(file_ids) and file_ids:
@@ -497,11 +519,15 @@ def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
                     project_output[proj_key] += int(out * ratio)
                     if cost * ratio > 0:
                         session_costs.append(cost * ratio)
+                        if tok > 0:
+                            session_tokens.append(int(tok * ratio))
                 else:
                     project_costs[proj_key] += cost
                     project_output[proj_key] += out
                     if cost > 0:
                         session_costs.append(cost)
+                        if tok > 0:
+                            session_tokens.append(tok)
                 project_duration[proj_key] += dur
                 seen_ids.update(file_ids)
                 if cwd and proj_key not in project_paths:
@@ -513,6 +539,7 @@ def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
                     "o": out,
                     "w": cwd,
                     "d": dur,
+                    "t": tok,
                     "ids": list(file_ids),
                 }
                 cache_dirty = True
@@ -531,7 +558,7 @@ def _load_projects_from_sessions(projects_base) -> list[ProjectInfo]:
                 duration_ms=project_duration.get(proj_key, 0),
             )
         )
-    return sorted(result, key=lambda p: p.cost, reverse=True), session_costs
+    return sorted(result, key=lambda p: p.cost, reverse=True), session_costs, session_tokens
 
 
 PROJECTS_BASE = Path.home() / ".claude" / "projects"
@@ -1194,7 +1221,7 @@ def parse(
 
     # Projects (from session logs for cumulative costs) + per-transcript costs
     # for the session-cost distribution.
-    projects, session_costs = _load_projects_from_sessions(_bases)
+    projects, session_costs, session_tokens = _load_projects_from_sessions(_bases)
 
     return ToolStats(
         source="claude",
@@ -1214,6 +1241,7 @@ def parse(
         projects=projects,
         tool_calls_by_name=tool_calls_by_name,
         session_costs=session_costs,
+        session_tokens=session_tokens,
         heatmap=_aux["heatmap"],
         stop_reasons=_aux["stop_reasons"],
         model_first_seen=_aux["model_first_seen"],

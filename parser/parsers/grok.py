@@ -339,7 +339,7 @@ def parse(
     # RESOLVED, NUL-joined bases; v2 tag bumped on accounting changes (see codex).
     base_hash = hashlib.md5("\x00".join(str(b.resolve()) for b in bases).encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    cache_path = cache_dir / f"grok-sessions-v4-{base_hash}.json"
+    cache_path = cache_dir / f"grok-sessions-v5-{base_hash}.json"
     fp = _dir_fingerprint(dirs)
     cached = _load_cache(cache_path)
     if cached and cached.get("fp") == fp:
@@ -410,6 +410,7 @@ def parse(
         hour_counts=dict(agg.messages_by_hour),
         rate_limits=[],
         projects=_build_projects(agg),
+        session_tokens=[s.context_tokens for s in agg.sessions if s.context_tokens > 0],
         heatmap=list(agg.heatmap),
         model_first_seen=dict(agg.model_first_seen),
         longest_session_duration_ms=longest_dur_ms,

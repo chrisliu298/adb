@@ -177,6 +177,11 @@ class ToolStats:
     # — the top-1%-of-sessions concentration — not just the average. Merged across
     # machines by concatenation; rounded to cents to stay compact.
     session_costs: list[float] = field(default_factory=list)
+    # Per-session TOTAL token counts (same partition as session_costs). Token-native
+    # so a cache-heavy runaway session — cheap per token yet enormous in volume —
+    # surfaces even when its cost doesn't stand out. Powers the Tok/Sess avg-vs-max
+    # row that makes a single thousands-of-turns session visible at a glance.
+    session_tokens: list[int] = field(default_factory=list)
 
     # weekday*24 + hour -> message count, local time (activity heatmap).
     heatmap: list[int] = field(default_factory=lambda: [0] * 168)
@@ -270,6 +275,7 @@ class ToolStats:
             ],
             "tool_calls_by_name": self.tool_calls_by_name,
             "session_costs": [round(c, 2) for c in self.session_costs],
+            "session_tokens": self.session_tokens,
             "heatmap": self.heatmap,
             "stop_reasons": self.stop_reasons,
             "model_first_seen": self.model_first_seen,
@@ -350,6 +356,7 @@ class ToolStats:
             ],
             tool_calls_by_name=dict(data.get("tool_calls_by_name", {})),
             session_costs=list(data.get("session_costs", [])),
+            session_tokens=[int(t) for t in data.get("session_tokens", [])],
             heatmap=_pad_heatmap(data.get("heatmap", [])),
             stop_reasons=dict(data.get("stop_reasons", {})),
             model_first_seen=dict(data.get("model_first_seen", {})),
