@@ -169,7 +169,7 @@ def _load_machine(
 
 
 SYNC_SCRIPT = REPO_DIR / "sync.sh"
-STALE_HOURS = 1
+STALE_HOURS = 1 / 6  # 10 minutes
 
 
 def _sync_remotes() -> None:
@@ -267,7 +267,8 @@ def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[Too
                 console.print("[grey50]No remote cache found — syncing...[/grey50]")
                 _sync_remotes()
             elif age > STALE_HOURS:
-                console.print(f"[grey50]Remote cache {age:.0f}h old — syncing...[/grey50]")
+                stale = f"{age * 60:.0f}m" if age < 1 else f"{age:.1f}h"
+                console.print(f"[grey50]Remote cache {stale} old — syncing...[/grey50]")
                 _sync_remotes()
 
     for host in include_remotes:
@@ -1502,7 +1503,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--sync", action="store_true",
-        help=f"force a remote sync (otherwise auto-runs only when cache > {STALE_HOURS}h old)",
+        help=f"force a remote sync (otherwise auto-runs only when cache > {STALE_HOURS * 60:.0f}m old)",
     )
     ap.add_argument(
         "--rebaseline", action="store_true",
