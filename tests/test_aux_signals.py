@@ -31,7 +31,7 @@ def _write(path, records):
 
 
 def _clear():
-    for c in (Path(__file__).resolve().parent.parent / ".cache").glob("claude-daily6-*.json"):
+    for c in (Path(__file__).resolve().parent.parent / ".cache").glob("claude-daily7-*.json"):
         c.unlink()
 
 

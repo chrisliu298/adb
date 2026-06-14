@@ -35,7 +35,7 @@ def _write(path: Path, sid: str) -> None:
 
 def _sessions(*dirs: Path) -> int:
     # Force a cold parse each call so we measure the parse, not a warm cache.
-    for c in (Path(__file__).resolve().parent.parent / ".cache").glob("claude-daily6-*.json"):
+    for c in (Path(__file__).resolve().parent.parent / ".cache").glob("claude-daily7-*.json"):
         c.unlink()
     daily, _aux = cp._build_daily_from_sessions(list(dirs))
     return sum(d.sessions for d in daily)

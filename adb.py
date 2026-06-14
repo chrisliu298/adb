@@ -10,7 +10,7 @@ import sys
 import time
 from copy import copy
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
 
@@ -487,7 +487,9 @@ def _history_active_days(history_path: Path) -> set[date]:
                     entry = orjson.loads(line)
                     ts = entry.get("timestamp")
                     if ts:
-                        dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+                        # epoch-ms is an absolute instant; bucket by LOCAL day so
+                        # streaks match the local-time daily activity.
+                        dt = datetime.fromtimestamp(ts / 1000)
                         days.add(dt.date())
                 except (orjson.JSONDecodeError, ValueError, TypeError):
                     continue

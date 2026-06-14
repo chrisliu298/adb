@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from datetime import UTC, date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import orjson
@@ -280,7 +280,9 @@ def _count_turns(history_path: Path) -> int | None:
 
 def _parse_date(s: str) -> date | None:
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+        # Convert UTC timestamps (e.g. firstSessionDate's '...Z') to the local
+        # calendar day; bare 'YYYY-MM-DD' strings pass through unshifted.
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone().date()
     except Exception:
         try:
             return date.fromisoformat(s[:10])
@@ -288,18 +290,16 @@ def _parse_date(s: str) -> date | None:
             return None
 
 
-def _local_wh(ts) -> int | None:
-    """weekday*24 + hour in LOCAL time from an ISO string or epoch-ms (None if bad)."""
+def _local_dt(ts) -> datetime | None:
+    """Local-time datetime from a UTC ISO string ('Z'/offset) or epoch-ms (None if bad)."""
     try:
         if isinstance(ts, str):
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
-        elif isinstance(ts, (int, float)):
-            dt = datetime.fromtimestamp(ts / 1000)
-        else:
-            return None
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+        if isinstance(ts, (int, float)):
+            return datetime.fromtimestamp(ts / 1000)
     except (ValueError, OSError):
         return None
-    return dt.weekday() * 24 + dt.hour
+    return None
 
 
 _TERMINAL_STOP_REASONS = frozenset(
@@ -842,15 +842,14 @@ def _parse_session_events(
                 if not ts:
                     continue
 
-                if isinstance(ts, str):
-                    day_str = ts[:10]
-                elif isinstance(ts, (int, float)):
-                    day_str = datetime.fromtimestamp(
-                        ts / 1000, tz=timezone.utc
-                    ).strftime("%Y-%m-%d")
-                else:
+                # Bucket the day and weekday×hour in LOCAL time (raw timestamps
+                # are UTC) so both derive from the same instant and match the
+                # Codex/Grok parsers and stats-cache's local dailyActivity.
+                ldt = _local_dt(ts)
+                if ldt is None:
                     continue
-                wh = _local_wh(ts)
+                day_str = ldt.strftime("%Y-%m-%d")
+                wh = ldt.weekday() * 24 + ldt.hour
 
                 msg = obj.get("message")
                 if not msg:
@@ -915,9 +914,10 @@ def _build_daily_from_sessions(
     dirs_str = ":".join(sorted(str(d) for d in projects_dirs))
     dirs_hash = hashlib.md5(dirs_str.encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    # v6: events also carry per-message cost [9] for the per-day cost total; v5
-    # carried tool_use names [5], weekday×hour [6], model [7], stop_reason [8].
-    cache_path = cache_dir / f"claude-daily6-{dirs_hash}.json"
+    # v7: day_str [0] is now bucketed in LOCAL time (was the raw UTC date); v6
+    # added per-message cost [9]; v5 carried tool_use names [5], weekday×hour [6],
+    # model [7], stop_reason [8].
+    cache_path = cache_dir / f"claude-daily7-{dirs_hash}.json"
     cache = _load_cache(cache_path)
     cache_dirty = False
 
