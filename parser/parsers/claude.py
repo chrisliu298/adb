@@ -49,6 +49,7 @@ PRICE: dict[str, list[float]] = {
     "mimo-v2.5": [0.14, 0.28],
     "minimax-m3": [0.6, 2.4],
     "kimi-k2.6": [0.95, 4.0],
+    "glm-5.2": [1.4, 4.4],
 }
 
 # Per-model cache pricing overrides as absolute $/MTok: (cache_read, cw_5m, cw_1h).
@@ -69,6 +70,9 @@ CACHE_OVERRIDES: dict[str, tuple[float, float, float]] = {
     # Kimi K2.6 publishes an explicit cache-hit price ($0.16/MTok) and no
     # cache-write premium, so writes price at the cache-miss (input) rate.
     "kimi-k2.6": (0.16, 0.95, 0.95),
+    # GLM-5.2 (Z.AI direct API) publishes a cached-input price ($0.26/MTok) and
+    # no cache-write premium, so writes price at the cache-miss (input) rate.
+    "glm-5.2": (0.26, 1.4, 1.4),
 }
 
 
