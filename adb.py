@@ -107,6 +107,7 @@ def _merge_two(a: ToolStats, b: ToolStats) -> ToolStats:
         for d, pct in src.rate_limit_history.items():
             rate_limit_history[d] = max(rate_limit_history.get(d, 0.0), pct)
     first_dates = [s.first_date for s in (a, b) if s.first_date]
+    extra = _merge_extra(a.extra, b.extra)
     proj_map: dict[str, ProjectInfo] = {}
     for p in a.projects + b.projects:
         if p.path in proj_map:
@@ -141,8 +142,32 @@ def _merge_two(a: ToolStats, b: ToolStats) -> ToolStats:
         longest_session_messages=(a.longest_session_messages if a.longest_session_duration_ms >= b.longest_session_duration_ms else b.longest_session_messages),
         unpriced_models=a.unpriced_models | b.unpriced_models,
         unpriced_tokens=a.unpriced_tokens + b.unpriced_tokens,
-        extra=a.extra or b.extra,
+        extra=extra,
     )
+
+
+def _merge_extra(a: dict, b: dict) -> dict:
+    """Merge ToolStats.extra, summing numeric diagnostics and preserving labels."""
+    merged = dict(a or {})
+    for key, value in (b or {}).items():
+        if key not in merged:
+            merged[key] = value
+            continue
+        current = merged[key]
+        if isinstance(current, (int, float)) and isinstance(value, (int, float)):
+            merged[key] = current + value
+        elif isinstance(current, str) and isinstance(value, str):
+            if not current and value:
+                merged[key] = value
+        elif isinstance(current, dict) and isinstance(value, dict):
+            sub = dict(current)
+            for subkey, subvalue in value.items():
+                if isinstance(sub.get(subkey), (int, float)) and isinstance(subvalue, (int, float)):
+                    sub[subkey] += subvalue
+                elif subkey not in sub:
+                    sub[subkey] = subvalue
+            merged[key] = sub
+    return merged
 
 
 def _merge_stats(stats: list[ToolStats]) -> ToolStats:
@@ -1059,6 +1084,58 @@ def print_stats(
         cost_summary.add_row("Reasoning", f"{fmt_tokens(reasoning_toks)} \u00b7 {r_pct:.0f}% of output [grey50](Codex)[/grey50]")
     cost_body = Group(cost_bar_table, Text(""), cost_summary)
 
+    def _top_missing_parts(raw: object, limit: int = 3) -> list[str]:
+        if not isinstance(raw, dict):
+            return []
+        items = [(str(k), int(v)) for k, v in raw.items() if isinstance(v, (int, float))]
+        return [
+            f"{name} {count:,}"
+            for name, count in sorted(items, key=lambda kv: kv[1], reverse=True)[:limit]
+        ]
+
+    def _codex_missing_warning() -> Text | None:
+        if not codex or not codex.extra.get("missing_token_sessions"):
+            return None
+        missing = int(codex.extra.get("missing_token_sessions") or 0)
+        no_snapshot = int(codex.extra.get("missing_token_no_snapshot_sessions") or 0)
+        after_last = int(codex.extra.get("missing_token_after_last_snapshot_sessions") or 0)
+        no_usage = int(codex.extra.get("missing_token_token_count_without_usage_sessions") or 0)
+        no_token_count = int(codex.extra.get("missing_token_no_token_count_sessions") or 0)
+        missing_input = int(codex.extra.get("missing_token_user_messages") or 0)
+        missing_input += int(codex.extra.get("missing_token_developer_messages") or 0)
+        missing_asst = int(codex.extra.get("missing_token_assistant_messages") or 0)
+        missing_tools = int(codex.extra.get("missing_token_tool_calls") or 0)
+
+        model_parts = _top_missing_parts(codex.extra.get("missing_token_by_model"))
+        month_parts = _top_missing_parts(codex.extra.get("missing_token_by_month"))
+        host_parts = []
+        if per_machine and len(per_machine) > 1:
+            host_counts = {}
+            for host, (_, machine_codex, _) in per_machine.items():
+                if machine_codex:
+                    count = int(machine_codex.extra.get("missing_token_sessions") or 0)
+                    if count:
+                        host_counts[host] = count
+            host_parts = _top_missing_parts(host_counts)
+        detail = (
+            f"Unmetered Codex: {missing:,} sessions "
+            f"({no_snapshot:,} no snapshot: {no_usage:,} token_count no usage, "
+            f"{no_token_count:,} no token_count; {after_last:,} after final snapshot); "
+            f"{missing_input:,} input msgs, {missing_asst:,} assistant msgs, {missing_tools:,} tools"
+        )
+        detail_parts = []
+        if host_parts:
+            detail_parts.append("hosts " + ", ".join(host_parts))
+        if model_parts:
+            detail_parts.append("models " + ", ".join(model_parts))
+        if month_parts:
+            detail_parts.append("months " + ", ".join(month_parts))
+        if detail_parts:
+            detail += "; " + "; ".join(detail_parts)
+        return Text(detail, style="yellow")
+
+    codex_missing_warning = _codex_missing_warning()
+
     # --- 4. MODELS ---
     if merged_models:
         models_table = Table(box=box.HORIZONTALS, border_style=BORDER, show_edge=False, padding=(0, 1), expand=True)
@@ -1121,11 +1198,14 @@ def print_stats(
         t_cost_sum = sum(c for _, c in merged_models.values())
         models_table.add_section()
         models_table.add_row("[bold]Total[/bold]", fmt_tokens(t_total), fmt_tokens(t_in), fmt_tokens(t_out), fmt_tokens(t_cache), Text.from_markup(fmt_cost_styled(t_cost_sum)), _fmt_weighted(w_in_num, w_in_den), _fmt_weighted(w_out_num, w_out_den), "", style="bold")
+        model_warnings: list[Text] = []
         if combined.unpriced_models:
             names = ", ".join(sorted(combined.unpriced_models))
             models_table.add_row(Text(f"Unpriced: {names} ({fmt_tokens(combined.unpriced_tokens)})", style="yellow"), "", "", "", "", "", "", "", "")
+        if codex_missing_warning:
+            model_warnings.append(codex_missing_warning)
         footnote = Text("In/Out $/M = token-weighted list price (family rows blend versions) \u00b7 % = share of total cost", style="dim")
-        model_extras = [Text(""), footnote]
+        model_extras = [Text("")]
         # Model-adoption timeline: the most recently first-seen models, so a cost
         # jump can be traced to "started using model X on date Y".
         if combined.model_first_seen:
@@ -1137,8 +1217,12 @@ def print_stats(
                 except ValueError:
                     lbl = d
                 parts.append(f"{m} ({lbl})")
-            model_extras.insert(1, Text("Newest: " + " \u00b7 ".join(parts), style="dim"))
+            model_extras.append(Text("Newest: " + " \u00b7 ".join(parts), style="dim"))
+        model_extras.extend(model_warnings)
+        model_extras.append(footnote)
         console.print(_section(Group(models_table, *model_extras), "Models"))
+    elif codex_missing_warning:
+        console.print(_section(Group(codex_missing_warning), "Models"))
 
     # --- 3. ACTIVITY ---
     SPARK_BLOCKS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"

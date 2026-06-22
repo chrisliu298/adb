@@ -38,6 +38,12 @@ def _rollout(path, sid, n_pad, tokens=None):
             f.write(orjson.dumps(r) + b"\n")
 
 
+def _write_rows(path, rows):
+    with open(path, "wb") as f:
+        for r in rows:
+            f.write(orjson.dumps(r) + b"\n")
+
+
 def test_session_id_read():
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / "codex_session.jsonl"
@@ -66,6 +72,34 @@ def test_dedup_keeps_token_richest():
         assert padded.stat().st_size > rich.stat().st_size  # sanity
         kept = _dedup_files_by_session([padded, rich])
     assert kept == [rich], kept
+
+
+def test_dedup_tie_keeps_diagnostic_richest_before_byte_size():
+    with tempfile.TemporaryDirectory() as d:
+        padded = Path(d) / "padded.jsonl"
+        diagnostic = Path(d) / "diagnostic.jsonl"
+        base = [
+            {"type": "session_meta", "timestamp": "2026-06-03T00:00:00Z",
+             "payload": {"id": "dup-diag", "cwd": "/x"}},
+            {"type": "event_msg", "timestamp": "2026-06-03T00:00:00Z",
+             "payload": {"type": "token_count",
+                         "info": {"total_token_usage": {"total_tokens": 100}}}},
+        ]
+        _write_rows(
+            padded,
+            base
+            + [{"type": "event_msg", "timestamp": "2026-06-03T00:00:01Z",
+                "payload": {"type": "notice", "pad": "x" * 2000}}],
+        )
+        _write_rows(
+            diagnostic,
+            base
+            + [{"type": "response_item", "timestamp": "2026-06-03T00:00:01Z",
+                "payload": {"type": "message", "role": "assistant"}}],
+        )
+        assert padded.stat().st_size > diagnostic.stat().st_size
+        kept = _dedup_files_by_session([padded, diagnostic])
+    assert kept == [diagnostic], kept
 
 
 def test_distinct_sessions_all_kept():

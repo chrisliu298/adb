@@ -145,6 +145,17 @@ class _Aggregates:
     heatmap: list = field(default_factory=lambda: [0] * 168)  # weekday*24+hour, local
     model_first_seen: dict = field(default_factory=dict)      # model -> earliest ISO day
     rl_by_day: dict = field(default_factory=dict)             # date -> max 5h used_percent
+    missing_token_sessions: int = 0
+    missing_token_assistant_messages: int = 0
+    missing_token_user_messages: int = 0
+    missing_token_developer_messages: int = 0
+    missing_token_tool_calls: int = 0
+    missing_token_by_model: dict[str, int] = field(default_factory=dict)
+    missing_token_by_month: dict[str, int] = field(default_factory=dict)
+    missing_token_no_snapshot_sessions: int = 0
+    missing_token_after_last_snapshot_sessions: int = 0
+    missing_token_token_count_without_usage_sessions: int = 0
+    missing_token_no_token_count_sessions: int = 0
 
 
 def _parse_ts(ts: str | None) -> datetime | None:
@@ -171,7 +182,9 @@ def _parse_session_file(
     started_at: datetime | None = None
     ended_at: datetime | None = None
     contexts: list[tuple[datetime, str]] = []
-    token_snapshots: list[tuple[datetime, _TokenUsage]] = []
+    token_snapshots: list[tuple[datetime, int, _TokenUsage]] = []
+    diagnostic_events: list[tuple[datetime, int, str]] = []
+    unusable_token_count_events = 0
     turns = tool_calls = user_messages = assistant_messages = 0
     active_days: set[date] = set()
     sess_rl_at: datetime | None = None
@@ -192,7 +205,7 @@ def _parse_session_file(
 
     try:
         with path.open("rb") as f:
-            for line in f:
+            for seq, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
                     continue
@@ -220,6 +233,7 @@ def _parse_session_file(
                     contexts.append((dt, str(model)))
                     if in_range:
                         turns += 1
+                        diagnostic_events.append((dt, seq, "turn"))
                         d = _local_day(dt)
                         active_days.add(d)
                         agg.daily.setdefault(d, DayActivity(day=d))
@@ -250,30 +264,45 @@ def _parse_session_file(
                         active_days.add(_local_day(dt))
                     info = payload.get("info")
                     if not info:
+                        if in_range:
+                            unusable_token_count_events += 1
+                            diagnostic_events.append((dt, seq, "token_count_no_usage"))
                         continue
                     total = info.get("total_token_usage")
                     if not isinstance(total, dict):
+                        if in_range:
+                            unusable_token_count_events += 1
+                            diagnostic_events.append((dt, seq, "token_count_no_usage"))
                         continue
-                    token_snapshots.append((dt, _TokenUsage.from_dict(total)))
+                    token_snapshots.append((dt, seq, _TokenUsage.from_dict(total)))
                     continue
 
                 if typ == "response_item":
                     item_type = payload.get("type")
-                    if item_type == "function_call":
+                    is_tool_call = item_type == "function_call" or (
+                        isinstance(item_type, str) and item_type.endswith("_call")
+                    )
+                    if is_tool_call:
                         if in_range:
-                            tool_calls += 1
+                            diagnostic_events.append((dt, seq, "tool"))
                             d = _local_day(dt)
                             active_days.add(d)
-                            agg.daily.setdefault(d, DayActivity(day=d)).tool_calls += 1
-                            name = payload.get("name")
-                            if isinstance(name, str) and name:
-                                agg.tool_calls_by_name[name] = (
-                                    agg.tool_calls_by_name.get(name, 0) + 1
-                                )
+                            if item_type == "function_call":
+                                tool_calls += 1
+                                agg.daily.setdefault(d, DayActivity(day=d)).tool_calls += 1
+                                name = payload.get("name")
+                                if isinstance(name, str) and name:
+                                    agg.tool_calls_by_name[name] = (
+                                        agg.tool_calls_by_name.get(name, 0) + 1
+                                    )
                         continue
                     if item_type == "message":
                         if in_range:
                             role = payload.get("role")
+                            if role in ("assistant", "developer", "user"):
+                                diagnostic_events.append((dt, seq, str(role)))
+                            else:
+                                diagnostic_events.append((dt, seq, "message"))
                             d = _local_day(dt)
                             active_days.add(d)
                             lt = _to_local(dt)
@@ -304,19 +333,19 @@ def _parse_session_file(
 
     def model_for(dt: datetime) -> str:
         if not ctx_times:
-            return "unknown"
+            return str(meta.get("model") or "unknown")
         i = bisect_right(ctx_times, dt) - 1
         # Forked subagent sessions emit token snapshots (inherited from the
         # parent) before their first turn_context. Backfill those with the
         # session's first known model rather than dropping them as "unknown".
         return ctx_models[i] if i >= 0 else ctx_models[0]
 
-    token_snapshots.sort(key=lambda x: x[0])
+    token_snapshots.sort(key=lambda x: (x[0], x[1]))
     prev = _TokenUsage()
     session_tokens = _TokenUsage()
     session_tokens_by_model: dict[str, _TokenUsage] = {}
 
-    for dt, totals in token_snapshots:
+    for dt, _, totals in token_snapshots:
         delta = _TokenUsage(
             input_tokens=max(0, totals.input_tokens - prev.input_tokens),
             cached_input_tokens=max(
@@ -355,6 +384,59 @@ def _parse_session_file(
         da.output_tokens += delta.output_tokens
         da.cost += sum(_usage_cost_parts(m, delta))
         agg.totals.add(delta)
+
+    counted_snapshot_keys = [
+        (dt, seq) for dt, seq, _ in token_snapshots if since is None or dt >= since
+    ]
+    last_counted_snapshot = max(counted_snapshot_keys, default=None)
+    if last_counted_snapshot is None:
+        no_snapshot_kinds = {"assistant", "developer", "user", "tool", "token_count_no_usage"}
+        unmetered_events = [
+            event for event in diagnostic_events if event[2] in no_snapshot_kinds
+        ]
+    else:
+        after_snapshot_events = [
+            event
+            for event in diagnostic_events
+            if (event[0], event[1]) > last_counted_snapshot
+        ]
+        new_request_kinds = {"developer", "turn", "user", "token_count_no_usage"}
+        unmetered_events = (
+            after_snapshot_events
+            if any(kind in new_request_kinds for _, _, kind in after_snapshot_events)
+            else []
+        )
+    if unmetered_events:
+        missing_at = max(unmetered_events, key=lambda event: (event[0], event[1]))[0]
+        missing_model = model_for(missing_at)
+        missing_month = _local_day(missing_at).strftime("%Y-%m")
+        agg.missing_token_sessions += 1
+        agg.missing_token_user_messages += sum(
+            1 for _, _, kind in unmetered_events if kind == "user"
+        )
+        agg.missing_token_developer_messages += sum(
+            1 for _, _, kind in unmetered_events if kind == "developer"
+        )
+        agg.missing_token_assistant_messages += sum(
+            1 for _, _, kind in unmetered_events if kind == "assistant"
+        )
+        agg.missing_token_tool_calls += sum(
+            1 for _, _, kind in unmetered_events if kind == "tool"
+        )
+        if last_counted_snapshot is None:
+            agg.missing_token_no_snapshot_sessions += 1
+            if unusable_token_count_events > 0:
+                agg.missing_token_token_count_without_usage_sessions += 1
+            else:
+                agg.missing_token_no_token_count_sessions += 1
+        else:
+            agg.missing_token_after_last_snapshot_sessions += 1
+        agg.missing_token_by_model[missing_model] = (
+            agg.missing_token_by_model.get(missing_model, 0) + 1
+        )
+        agg.missing_token_by_month[missing_month] = (
+            agg.missing_token_by_month.get(missing_month, 0) + 1
+        )
 
     cwd = meta.get("cwd")
     repo_url = (meta.get("git") or {}).get("repository_url")
@@ -519,6 +601,45 @@ def _session_max_total_tokens(path: Path) -> int:
     return best
 
 
+def _session_diagnostic_score(path: Path) -> int:
+    """Substantive non-token evidence used only as a duplicate tie-break."""
+    score = 0
+    try:
+        with path.open("rb") as f:
+            for line in f:
+                if (
+                    b'"response_item"' not in line
+                    and b'"token_count"' not in line
+                ):
+                    continue
+                try:
+                    o = orjson.loads(line)
+                except orjson.JSONDecodeError:
+                    continue
+                typ = o.get("type")
+                payload = o.get("payload") or {}
+                if typ == "response_item":
+                    item_type = payload.get("type")
+                    if item_type == "message" and payload.get("role") in (
+                        "assistant",
+                        "developer",
+                        "user",
+                    ):
+                        score += 1
+                    elif item_type == "function_call" or (
+                        isinstance(item_type, str) and item_type.endswith("_call")
+                    ):
+                        score += 1
+                elif typ == "event_msg" and payload.get("type") == "token_count":
+                    info = payload.get("info")
+                    total = info.get("total_token_usage") if isinstance(info, dict) else None
+                    if not isinstance(total, dict):
+                        score += 1
+    except OSError:
+        pass
+    return score
+
+
 def _dedup_files_by_session(files: list[Path]) -> list[Path]:
     """Collapse duplicate rollouts of the same Codex session to a single file.
 
@@ -549,8 +670,15 @@ def _dedup_files_by_session(files: list[Path]) -> list[Path]:
     for ps in by_sid.values():
         if len(ps) == 1:
             kept.append(ps[0])
-        else:  # token-richest wins, byte size as the tie-break
-            kept.append(max(ps, key=lambda p: (_session_max_total_tokens(p), _size(p))))
+        else:  # token-richest wins; diagnostics/byte size break ties.
+            kept.append(max(
+                ps,
+                key=lambda p: (
+                    _session_max_total_tokens(p),
+                    _session_diagnostic_score(p),
+                    _size(p),
+                ),
+            ))
     return sorted(unkeyed + kept)
 
 
@@ -632,7 +760,7 @@ def parse(
     base_hash = hashlib.md5("\x00".join(str(b.resolve()) for b in bases).encode()).hexdigest()[:12]
     if cache_dir is None:
         cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    cache_path = cache_dir / f"codex-sessions-v7-{base_hash}.json"
+    cache_path = cache_dir / f"codex-sessions-v11-{base_hash}.json"
     fp = _dir_fingerprint(files)
     cached = _load_codex_cache(cache_path)
     if cached and cached.get("fp") == fp:
@@ -787,7 +915,20 @@ def parse(
         longest_session_messages=longest_msgs,
         unpriced_models=unpriced_models,
         unpriced_tokens=unpriced_tokens,
-        extra={"tier": tier},
+        extra={
+            "tier": tier,
+            "missing_token_sessions": agg.missing_token_sessions,
+            "missing_token_assistant_messages": agg.missing_token_assistant_messages,
+            "missing_token_user_messages": agg.missing_token_user_messages,
+            "missing_token_developer_messages": agg.missing_token_developer_messages,
+            "missing_token_tool_calls": agg.missing_token_tool_calls,
+            "missing_token_by_model": dict(agg.missing_token_by_model),
+            "missing_token_by_month": dict(agg.missing_token_by_month),
+            "missing_token_no_snapshot_sessions": agg.missing_token_no_snapshot_sessions,
+            "missing_token_after_last_snapshot_sessions": agg.missing_token_after_last_snapshot_sessions,
+            "missing_token_token_count_without_usage_sessions": agg.missing_token_token_count_without_usage_sessions,
+            "missing_token_no_token_count_sessions": agg.missing_token_no_token_count_sessions,
+        },
     )
     _save_codex_cache(cache_path, fp, result)
     return result
