@@ -19,6 +19,10 @@ uv run python adb.py
 uv run python adb.py local
 uv run python adb.py local server1
 
+# Lite — glanceable spend pulse (offline, no rate-limit fetch); scope args still apply
+uv run python adb.py lite
+uv run python adb.py lite local
+
 # Sync remote machine data before running
 ./sync.sh
 

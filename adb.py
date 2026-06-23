@@ -18,6 +18,7 @@ from rich import box
 from rich.align import Align
 from rich.console import Console, Group
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
@@ -214,13 +215,15 @@ def _remote_cache_age_hours(hosts: list[str]) -> float | None:
     return (time.time() - max(mtimes)) / 3600
 
 
-def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[ToolStats | None, ToolStats | None, ToolStats | None, MachineData]:
+def load_all(machines: list[str] | None = None, sync: bool = False, fetch_rate_limits: bool = True) -> tuple[ToolStats | None, ToolStats | None, ToolStats | None, MachineData]:
     """Load and merge stats from local + remote machines.
 
     machines: list of machine names to include. None or ["all"] means local + all remotes.
               ["local"] means local only. Otherwise, include local + named remotes.
     sync: if True, force a fresh sync.sh run; otherwise sync only when the
           remote cache is missing or older than STALE_HOURS.
+    fetch_rate_limits: passed to the Claude parser; False skips the OAuth network
+          fetch (the lite view's offline glance).
     """
     # Build work items: (name, claude_kwargs, codex_kwargs, grok_kwargs)
     work: list[tuple[str, dict | None, dict | None, dict | None]] = []
@@ -236,7 +239,7 @@ def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[Too
     local_ck = dict(projects_base=[
         DATA_DIR / "claude" / "local",
         Path.home() / ".claude" / "projects",  # live overlay (freshness + LAM discovery)
-    ])
+    ], fetch_rate_limits=fetch_rate_limits)
     local_xk = dict(sessions_dirs=[
         DATA_DIR / "codex" / "local",
         *_local_codex_session_dirs(),  # live overlays
@@ -287,6 +290,7 @@ def load_all(machines: list[str] | None = None, sync: bool = False) -> tuple[Too
                 stats_path=cdir / ".meta" / "stats-cache.json",
                 history_path=cdir / ".meta" / "history.jsonl",
                 projects_base=[cdir],
+                fetch_rate_limits=fetch_rate_limits,
             )
         xdir = DATA_DIR / "codex" / host
         xk = dict(sessions_dirs=[xdir]) if xdir.is_dir() else None
@@ -337,6 +341,32 @@ def fmt_tokens(n: int) -> str:
 
 def fmt_cost(c: float) -> str:
     return f"${c:,.2f}"
+
+
+def fmt_cost_compact(c: float) -> str:
+    """Short money for tight cells: $1.2M, $74.5K, $2,147. Keeps lite from wrapping."""
+    if c >= 1_000_000:
+        return f"${c / 1_000_000:.1f}M"
+    if c >= 10_000:
+        return f"${c / 1_000:.1f}K"
+    return f"${c:,.0f}"
+
+
+SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
+SPARK_GRADIENT = [
+    "#2a5a5a", "#3a7a7a", "#4a9a9a", "#5ababa",
+    "#6adada", "#7aeaea", "#8affff", "#afffff",
+]
+
+
+def _sparkline(vals) -> Text:
+    """8-level gradient sparkline scaled to the series max (0 → lowest block)."""
+    mx = max(vals) or 1
+    t = Text()
+    for v in vals:
+        idx = min(7, max(0, int(v / mx * 7))) if v > 0 else 0
+        t.append(SPARK_BLOCKS[idx], style=SPARK_GRADIENT[idx])
+    return t
 
 
 def fmt_duration(ms: int) -> str:
@@ -535,28 +565,29 @@ def compute_streak(
     return streak
 
 
-# ---------------------------------------------------------------------------
-# Terminal output
-# ---------------------------------------------------------------------------
+def _count_active_days(combined: ToolStats) -> int:
+    """Distinct active days across merged daily records + local/remote history."""
+    days = {d.day for d in combined.daily}
+    days |= _history_active_days(HISTORY_PATH)
+    for host in _load_remote_hosts():
+        days |= _history_active_days(DATA_DIR / "claude" / host / ".meta" / "history.jsonl")
+    return len(days)
 
 
-def print_stats(
+def _lifetime_display(
     claude: ToolStats | None,
     codex: ToolStats | None,
-    grok: ToolStats | None = None,
-    per_machine: MachineData | None = None,
-    apply_floor: bool = False,
-    rebaseline: bool = False,
-) -> None:
-    stats_list = [s for s in (claude, codex, grok) if s is not None]
-    combined = _merge_stats(stats_list)
-    total_cost = combined.total_cost
-    total_tokens = combined.total_tokens.total
-    # Floor guard: the lifetime per-tool token total must never decrease. Only on
-    # the full run (a subset computes less, which must not trip it). On a drop,
-    # HOLD ONLY the headline lifetime cell at the high-water — all derived math
-    # (cost/1K, daily avg, per-machine) keeps the real computed totals so ratios
-    # stay consistent; the banner explains the gap.
+    grok: ToolStats | None,
+    total_tokens: int,
+    apply_floor: bool,
+    rebaseline: bool,
+) -> int:
+    """Apply the never-decrease floor guard to the lifetime token total.
+
+    On a full run, holds the displayed lifetime at the recorded per-tool
+    high-water and prints a DATA-LOSS banner on regression. Shared by the full
+    dashboard and the lite view so both honor the same floor.
+    """
     lifetime_display = total_tokens
     if apply_floor:
         _computed = {
@@ -583,17 +614,96 @@ def print_stats(
                     "real (lower) computed values. Investigate the store, or re-run with --rebaseline to accept it."
                 )
             console.print(Panel(_msg, style="red", border_style="red"))
+    return lifetime_display
+
+
+class _Recent(NamedTuple):
+    """Recent-window token sums (msgs, sessions, tool_calls, output_tokens per
+    window) + the per-output-token cost ratio. Costs are derived as
+    output_tokens * cost_per_token by the caller, so both views estimate identically."""
+    cost_per_token: float
+    today: tuple[int, int, int, int]
+    yesterday: tuple[int, int, int, int]
+    week: tuple[int, int, int, int]
+    month: tuple[int, int, int, int]
+    pw_otoks: int
+    pm_otoks: int
+    week_start: date
+    month_start: date
+    n_week_days: int
+
+
+def _compute_recent(
+    daily_by_date: dict[date, DayActivity], total_cost: float, total_output_tokens: int, today: date
+) -> _Recent:
+    """Sum today/yesterday/this-week/this-month (+ prior-week/-month) activity.
+
+    The single source of the recent-window derivation, shared by the full
+    dashboard's RECENT table and the lite view, so a glance and the full run
+    never disagree on today's spend or the pace base.
+    """
+    cpt = total_cost / total_output_tokens if total_output_tokens > 0 else 0.0
+
+    def _sum(start: date, end: date) -> tuple[int, int, int, int]:
+        msgs = sess = tools = otoks = 0
+        for d, da in daily_by_date.items():
+            if start <= d <= end:
+                msgs += da.messages
+                sess += da.sessions
+                tools += da.tool_calls
+                otoks += da.output_tokens
+        return msgs, sess, tools, otoks
+
+    today_t = _sum(today, today)
+    yest = today - timedelta(days=1)
+    yest_t = _sum(yest, yest)
+
+    week_start = today - timedelta(days=today.weekday())
+    week_t = _sum(week_start, today)
+    n_week_days = (today - week_start).days + 1
+    prev_week_start = week_start - timedelta(days=7)
+    prev_week_end = prev_week_start + timedelta(days=n_week_days - 1)
+    pw_otoks = _sum(prev_week_start, prev_week_end)[3]
+
+    month_start = today.replace(day=1)
+    month_t = _sum(month_start, today)
+    prev_month_start = (month_start - timedelta(days=1)).replace(day=1)
+    prev_month_end = prev_month_start + timedelta(days=today.day - 1)
+    pm_otoks = _sum(prev_month_start, prev_month_end)[3]
+
+    return _Recent(cpt, today_t, yest_t, week_t, month_t, pw_otoks, pm_otoks, week_start, month_start, n_week_days)
+
+
+# ---------------------------------------------------------------------------
+# Terminal output
+# ---------------------------------------------------------------------------
+
+
+def print_stats(
+    claude: ToolStats | None,
+    codex: ToolStats | None,
+    grok: ToolStats | None = None,
+    per_machine: MachineData | None = None,
+    apply_floor: bool = False,
+    rebaseline: bool = False,
+) -> None:
+    stats_list = [s for s in (claude, codex, grok) if s is not None]
+    combined = _merge_stats(stats_list)
+    total_cost = combined.total_cost
+    total_tokens = combined.total_tokens.total
+    # Floor guard: the lifetime per-tool token total must never decrease. Only on
+    # the full run (a subset computes less, which must not trip it). On a drop,
+    # HOLD ONLY the headline lifetime cell at the high-water — all derived math
+    # (cost/1K, daily avg, per-machine) keeps the real computed totals so ratios
+    # stay consistent; the banner explains the gap.
+    lifetime_display = _lifetime_display(claude, codex, grok, total_tokens, apply_floor, rebaseline)
     total_sessions = combined.total_sessions
     total_messages = combined.total_messages
     total_tool_calls = combined.total_tool_calls
     total_turns = combined.total_turns
     total_output_tokens = combined.total_tokens.output_tokens
     first_date = combined.first_date
-    _all_active_days = {d.day for d in combined.daily}
-    _all_active_days |= _history_active_days(HISTORY_PATH)
-    for _host in _load_remote_hosts():
-        _all_active_days |= _history_active_days(DATA_DIR / "claude" / _host / ".meta" / "history.jsonl")
-    days_active = len(_all_active_days)
+    days_active = _count_active_days(combined)
     streak = compute_streak(claude, codex, grok)
     daily_by_date = {d.day: d for d in combined.daily}
     merged_models = {m: (tb, combined.model_costs.get(m, 0.0)) for m, tb in combined.models.items()}
@@ -614,43 +724,19 @@ def print_stats(
 
     # --- 1. RECENT (Today / This Week / This Month) ---
     today = date.today()
-    cost_per_token = total_cost / total_output_tokens if total_output_tokens > 0 else 0
-
-    def _sum_range(start: date, end: date) -> tuple[int, int, int, int]:
-        """Sum messages, sessions, tool_calls, output_tokens for [start, end]."""
-        msgs = sess = tools = otoks = 0
-        for d, da in daily_by_date.items():
-            if start <= d <= end:
-                msgs += da.messages
-                sess += da.sessions
-                tools += da.tool_calls
-                otoks += da.output_tokens
-        return msgs, sess, tools, otoks
-
-    # Today
-    t_msgs, t_sess, t_tools, t_otoks = _sum_range(today, today)
+    _r = _compute_recent(daily_by_date, total_cost, total_output_tokens, today)
+    cost_per_token = _r.cost_per_token
+    t_msgs, t_sess, t_tools, t_otoks = _r.today
     t_cost = t_otoks * cost_per_token
-
-    # This week (Mon-today)
-    week_start = today - timedelta(days=today.weekday())
-    w_msgs, w_sess, w_tools, w_otoks = _sum_range(week_start, today)
+    week_start = _r.week_start
+    w_msgs, w_sess, w_tools, w_otoks = _r.week
     w_cost = w_otoks * cost_per_token
-    # Last week (same number of elapsed days for fair comparison)
-    n_week_days = (today - week_start).days + 1
-    prev_week_start = week_start - timedelta(days=7)
-    prev_week_end = prev_week_start + timedelta(days=n_week_days - 1)
-    _, _, _, pw_otoks = _sum_range(prev_week_start, prev_week_end)
-    pw_cost = pw_otoks * cost_per_token
-
-    # This month (1st-today)
-    month_start = today.replace(day=1)
-    m_msgs, m_sess, m_tools, m_otoks = _sum_range(month_start, today)
+    n_week_days = _r.n_week_days
+    pw_cost = _r.pw_otoks * cost_per_token
+    month_start = _r.month_start
+    m_msgs, m_sess, m_tools, m_otoks = _r.month
     m_cost = m_otoks * cost_per_token
-    # Last month (same number of elapsed days for fair comparison)
-    prev_month_start = (month_start - timedelta(days=1)).replace(day=1)
-    prev_month_end = prev_month_start + timedelta(days=today.day - 1)
-    _, _, _, pm_otoks = _sum_range(prev_month_start, prev_month_end)
-    pm_cost = pm_otoks * cost_per_token
+    pm_cost = _r.pm_otoks * cost_per_token
 
     # Cost deltas
     def _delta(cur: float, prev: float) -> str:
@@ -691,10 +777,6 @@ def print_stats(
         "Input":    "#af87d7",
         "Output":   "#87d7af",
     }
-    SPARK_GRADIENT = [
-        "#2a5a5a", "#3a7a7a", "#4a9a9a", "#5ababa",
-        "#6adada", "#7aeaea", "#8affff", "#afffff",
-    ]
     SECTION_COLORS = {
         "Recent":          "bold cornflower_blue",
         "Models":          "bold medium_purple",
@@ -769,11 +851,11 @@ def print_stats(
             return ""
         pct = (cur - prev) / prev * 100
         if pct > 0:
-            return f" [#5fd787](\u2191{pct:.0f}%)[/#5fd787]"
+            return f" [#5fd787](↑{pct:.0f}%)[/#5fd787]"
         elif pct < 0:
-            return f" [#d75f5f](\u2193{abs(pct):.0f}%)[/#d75f5f]"
+            return f" [#d75f5f](↓{abs(pct):.0f}%)[/#d75f5f]"
         else:
-            return f" [grey50](\u21920%)[/grey50]"
+            return f" [grey50](→0%)[/grey50]"
 
     def _kv_table() -> Table:
         t = Table(box=None, show_header=False, show_edge=False, padding=(0, 2, 0, 0), expand=True)
@@ -1142,17 +1224,6 @@ def print_stats(
         console.print(_section(Group(models_table, *model_extras), "Models"))
 
     # --- 3. ACTIVITY ---
-    SPARK_BLOCKS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
-
-    def _sparkline(vals) -> Text:
-        """8-level gradient sparkline scaled to the series max (0 \u2192 lowest block)."""
-        mx = max(vals) or 1
-        t = Text()
-        for v in vals:
-            idx = min(7, max(0, int(v / mx * 7))) if v > 0 else 0
-            t.append(SPARK_BLOCKS[idx], style=SPARK_GRADIENT[idx])
-        return t
-
     act = Table(box=None, show_header=False, show_edge=False, padding=(0, 1, 0, 0), expand=True)
     act.add_column("key", style="bold", no_wrap=True)
     act.add_column("value", no_wrap=True, ratio=1)
@@ -1493,6 +1564,265 @@ def print_stats(
             console.print(_section(proj_table, "Projects (Top 10)"))
 
 
+def print_lite(
+    claude: ToolStats | None,
+    codex: ToolStats | None,
+    grok: ToolStats | None = None,
+    apply_floor: bool = False,
+    rebaseline: bool = False,
+) -> None:
+    """Glanceable spend pulse — the lite view.
+
+    A thin formatter over the same merged ToolStats the full dashboard uses,
+    tokens-forward, wrapped in one rounded grey30 panel matching the dashboard's
+    aesthetic with labeled Rule dividers: a hero (lifetime tokens · cost ·
+    streak); 30-day token & spend sparklines; an Agents band (token-share bar,
+    tokens, cost, cache-hit %, tier); a Usage band (yest/today/week/month tokens,
+    spend, trend, pace + today's exact activity counts); a Lifetime band (token
+    make-up, model mix, session-size spread); and a context footer. No network
+    (rate limits are skipped upstream via load_all(fetch_rate_limits=False));
+    none of the six analytical sections.
+    """
+    stats_list = [s for s in (claude, codex, grok) if s is not None]
+    if not stats_list:
+        print("No usage data found.")
+        return
+    combined = _merge_stats(stats_list)
+    total_cost = combined.total_cost
+    total_output_tokens = combined.total_tokens.output_tokens
+    lifetime_display = _lifetime_display(
+        claude, codex, grok, combined.total_tokens.total, apply_floor, rebaseline
+    )
+    days_active = _count_active_days(combined)
+    streak = compute_streak(claude, codex, grok)
+    avg_cost = total_cost / days_active if days_active else 0
+
+    today = date.today()
+    daily_by_date = {d.day: d for d in combined.daily}
+    _r = _compute_recent(daily_by_date, total_cost, total_output_tokens, today)
+    cpt = _r.cost_per_token
+    t_cost = _r.today[3] * cpt
+    y_cost = _r.yesterday[3] * cpt
+    w_cost = _r.week[3] * cpt
+    m_cost = _r.month[3] * cpt
+    days_in_month = calendar.monthrange(today.year, today.month)[1]
+    proj_week = w_cost / _r.n_week_days * 7 if _r.n_week_days else 0
+    proj_month = m_cost / today.day * days_in_month if today.day else 0
+
+    pw_cost = _r.pw_otoks * cpt
+    pm_cost = _r.pm_otoks * cpt
+
+    # Per-window TOTAL tokens are estimated by scaling that window's output tokens
+    # by the lifetime total/output ratio — the same approximation the full RECENT
+    # table uses. Lifetime tokens use the floor-guarded display value.
+    raw_total_tokens = combined.total_tokens.total
+    tok_ratio = raw_total_tokens / total_output_tokens if total_output_tokens > 0 else 0
+    t_tok = _r.today[3] * tok_ratio
+    w_tok = _r.week[3] * tok_ratio
+    m_tok = _r.month[3] * tok_ratio
+    avg_tok = lifetime_display / days_active if days_active else 0
+
+    y_tok = _r.yesterday[3] * tok_ratio
+
+    # Lifetime model-family mix (cumulative — labeled as such), reusing the full
+    # dashboard's family rollup so the labels match.
+    merged_models = {m: (tb, combined.model_costs.get(m, 0.0)) for m, tb in combined.models.items()}
+    families = sorted(_family_summaries(merged_models), key=lambda f: -f.tb.total)
+    top_fams = [f for f in families if f.tb.total > 0][:3]
+
+    # Lifetime session-size spread — surfaces a runaway session.
+    sess_toks = combined.session_tokens
+    sess_costs = combined.session_costs
+    avg_sess_tok = sum(sess_toks) / len(sess_toks) if sess_toks else 0
+    max_sess_tok = max(sess_toks) if sess_toks else 0
+    max_sess_cost = max(sess_costs) if sess_costs else 0.0
+
+    # 30-day daily series for the trend sparklines (output tokens + exact cost).
+    # sqrt-compress the range so one outlier day doesn't flatten the rest to ▁.
+    last30 = [today - timedelta(days=i) for i in range(29, -1, -1)]
+    tok_series = [(daily_by_date[d].output_tokens if d in daily_by_date else 0) ** 0.5 for d in last30]
+    cost_series = [(daily_by_date[d].cost if d in daily_by_date else 0) ** 0.5 for d in last30]
+
+    _tb = combined.total_tokens  # lifetime token make-up (input / output / cache)
+
+    ACCENT = "#d7af5f"
+    DIM = "grey50"
+    SEP = "grey37"
+    GREY = "grey62"
+    TOK = "bold grey85"
+    TOOL_COLORS = {"claude": "#d77757", "codex": "#39c5cf", "grok": "#c0c0c0"}
+    TOOL_NAMES = {"claude": "Claude", "codex": "Codex", "grok": "Grok"}
+
+    def _trend(cur: float, prev: float) -> Text:
+        """Bare ↑/↓ percent vs the prior period — clean enough for a table cell."""
+        if prev <= 0:
+            return Text("—", style=DIM)
+        pct = (cur - prev) / prev * 100
+        if pct > 0:
+            return Text(f"↑{pct:.0f}%", style="#5fd787")
+        if pct < 0:
+            return Text(f"↓{abs(pct):.0f}%", style="#d75f5f")
+        return Text("→0%", style=DIM)
+
+    def _cache_pct(tb: TokenBreakdown) -> float | None:
+        """Cache-read hit rate: cached input / all input. None when no input seen."""
+        denom = tb.input_tokens + tb.cache_read_tokens
+        return tb.cache_read_tokens / denom * 100 if denom > 0 else None
+
+    IN_C, OUT_C, CACHE_C = "#af87d7", "#87d7af", "#5f87d7"  # match the full Cost section
+
+    def _share_bar(pct: float, color: str) -> Text:
+        """A 10-wide proportion bar in the tool's color (no track) + the percent."""
+        fill = max(0, min(10, int(round(pct / 100 * 10))))
+        t = Text()
+        t.append("█" * fill, style=color)
+        t.append(" " * (10 - fill))
+        t.append(f" {pct:>3.0f}%", style=GREY)
+        return t
+
+    def _stack_bar(parts: list[tuple[float, str]], width: int = 18) -> Text:
+        """A single stacked proportion bar; each nonzero part gets ≥1 cell."""
+        vals = [max(0.0, float(v)) for v, _ in parts]
+        total = sum(vals) or 1.0
+        widths = [max(1, round(v / total * width)) if v > 0 else 0 for v in vals]
+        if widths:
+            big = max(range(len(widths)), key=lambda i: widths[i])
+            widths[big] = max(1, widths[big] + (width - sum(widths)))
+        t = Text()
+        for (v, c), w in zip(parts, widths):
+            if w > 0:
+                t.append("█" * w, style=c)
+        return t
+
+    def _fam_color(name: str) -> str:
+        if name.startswith("Claude"): return "#d77757"
+        if name.startswith("GPT"):    return "#39c5cf"
+        if name.startswith("Grok"):   return "#c0c0c0"
+        return "grey58"
+
+    def _div(label: str) -> Rule:
+        return Rule(Text(f" {label} ", style=DIM), characters="─", style="grey30", align="left")
+
+    # Hero — lifetime tokens lead (floor-guarded) · exact cost · streak.
+    hero = Text.assemble(
+        (f"{fmt_tokens(lifetime_display)} tok", TOK), ("   ·   ", SEP),
+        (fmt_cost(total_cost), f"bold {ACCENT}"), ("   ·   ", SEP),
+        (f"{streak}d streak \U0001f525", GREY),
+    )
+
+    # 30-day trend sparklines (tokens shape from daily output; spend exact).
+    spark_tok = Text.assemble(("tokens 30d  ", DIM), _sparkline(tok_series), (f"  today ~{fmt_tokens(int(t_tok))}", TOK))
+    spark_cost = Text.assemble(("spend  30d  ", DIM), _sparkline(cost_series), (f"  today ~{fmt_cost_compact(t_cost)}", ACCENT))
+
+    # Agents + Usage share one column grid (label/tokens/cost align across both).
+    def _grid() -> Table:
+        t = Table(box=None, padding=(0, 2, 0, 0), header_style=DIM)
+        t.add_column("", style="bold", no_wrap=True, width=7)
+        t.add_column("Tokens", justify="right", no_wrap=True, width=7)
+        t.add_column("Cost", justify="right", no_wrap=True, width=7)
+        t.add_column("Cache", justify="right", no_wrap=True, width=6)
+        return t
+
+    agents = _grid()
+    agents.add_column("Share", no_wrap=True)
+    agents.add_column("Tier", style=DIM, no_wrap=True)
+    for s in stats_list:
+        tier = s.extra.get("tier", "")
+        tier_str = f"{tier[:1].upper()}{tier[1:]}" if tier else ""
+        share = s.total_tokens.total / raw_total_tokens * 100 if raw_total_tokens else 0
+        cp = _cache_pct(s.total_tokens)
+        color = TOOL_COLORS.get(s.source, GREY)
+        agents.add_row(
+            Text(TOOL_NAMES.get(s.source, s.source.title()), style=color),
+            Text(fmt_tokens(s.total_tokens.total), style=TOK),
+            Text(fmt_cost_compact(s.total_cost), style=ACCENT),
+            Text(f"{cp:.0f}%", style=GREY) if cp is not None else Text("—", style=DIM),
+            _share_bar(share, color),
+            tier_str,
+        )
+
+    # Usage — yesterday/today/week/month. Token/spend are estimates → "~"; the
+    # message/call counts (right) are exact per-window DayActivity sums.
+    usage = _grid()
+    usage.columns[2].header = "Spend"
+    usage.columns[3].header = "Trend"
+    usage.add_column("Pace", justify="right", no_wrap=True, width=8)
+    usage.add_column("Msgs", justify="right", no_wrap=True, width=6)
+    usage.add_column("Calls", justify="right", no_wrap=True, width=6)
+
+    def _urow(label, otok, cost, trend, pace, window):
+        usage.add_row(
+            label,
+            Text(f"~{fmt_tokens(int(otok))}", style=TOK),
+            Text(f"~{fmt_cost_compact(cost)}", style=ACCENT),
+            trend, pace,
+            Text(fmt_tokens(window[0]), style=GREY),
+            Text(fmt_tokens(window[2]), style=GREY),
+        )
+
+    _dash = Text("—", style=DIM)
+    _urow("Yest", y_tok, y_cost, _dash, _dash, _r.yesterday)
+    _urow("Today", t_tok, t_cost, _trend(t_cost, y_cost), _dash, _r.today)
+    _urow("Week", w_tok, w_cost, _trend(w_cost, pw_cost), Text(f"~{fmt_cost_compact(proj_week)}", style=DIM), _r.week)
+    _urow("Month", m_tok, m_cost, _trend(m_cost, pm_cost), Text(f"~{fmt_cost_compact(proj_month)}", style=DIM), _r.month)
+
+    # Lifetime — colored stacked bars for token make-up and model mix.
+    _cache_tok = _tb.cache_read_tokens + _tb.cache_write_tokens
+    tok_bar = _stack_bar([(_cache_tok, CACHE_C), (_tb.input_tokens, IN_C), (_tb.output_tokens, OUT_C)])
+    tok_legend = Text.assemble(
+        (f"cache {fmt_tokens(_cache_tok)}", CACHE_C), ("  ", None),
+        (f"in {fmt_tokens(_tb.input_tokens)}", IN_C), ("  ", None),
+        (f"out {fmt_tokens(_tb.output_tokens)}", OUT_C),
+    )
+    model_bar = _stack_bar([(f.tb.total, _fam_color(f.name)) for f in families if f.tb.total > 0])
+    model_legend = Text()
+    for i, f in enumerate(top_fams):
+        if i:
+            model_legend.append("  ")
+        model_legend.append(f"{f.name.replace('Claude ', '')} {f.tb.total / raw_total_tokens * 100:.0f}%", style=_fam_color(f.name))
+
+    detail = Table(box=None, show_header=False, padding=(0, 2, 0, 0))
+    detail.add_column("k", style=DIM, no_wrap=True, width=7)
+    detail.add_column("bar", no_wrap=True, width=18)
+    detail.add_column("v", no_wrap=True)
+    detail.add_row("tokens", tok_bar, tok_legend)
+    detail.add_row("models", model_bar, model_legend)
+
+    session_line = Text.assemble(
+        ("session  ", DIM),
+        (f"~{fmt_tokens(int(avg_sess_tok))} avg", GREY), ("  ·  ", SEP),
+        (f"{fmt_tokens(int(max_sess_tok))} max tok", "#d7875f"), ("  ·  ", SEP),
+        (f"{fmt_cost_compact(max_sess_cost)} max", "#d7875f"),
+    )
+
+    # Context footer — colored so the bottom isn't a wall of grey.
+    avg_sess_cost = sum(sess_costs) / len(sess_costs) if sess_costs else 0.0
+    ctx = Text.assemble(
+        (f"{days_active}d active", GREY), ("   ·   ", SEP),
+        (f"{fmt_tokens(int(avg_tok))} tok/d", TOK), ("   ·   ", SEP),
+        (f"{fmt_cost(avg_cost)}/d", f"bold {ACCENT}"), ("   ·   ", SEP),
+        (f"{fmt_cost_compact(avg_sess_cost)}/sess", ACCENT),
+    )
+
+    # One rounded panel — the dashboard's grey30 aesthetic, sized to content so it
+    # never wraps; labeled Rule dividers structure the bands.
+    body = Group(
+        hero, Text(""),
+        spark_tok, spark_cost, Text(""),
+        _div("Agents"), agents, Text(""),
+        _div("Usage"), usage, Text(""),
+        _div("Lifetime"), detail, session_line, Text(""),
+        ctx,
+    )
+    console.print()
+    console.print(Panel(
+        body, box=box.ROUNDED, border_style="grey30",
+        title="[bold bright_white]adb · lite[/]", title_align="left",
+        expand=False, padding=(1, 2),
+    ))
+    console.print()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1502,7 +1832,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Claude Code and Codex usage statistics")
     ap.add_argument(
         "machines", nargs="*", default=["all"],
-        help="machines to include (default: all). Use 'local' for local only, or list specific remote names.",
+        help="machines to include (default: all). Use 'local' for local only, or list specific remote names. "
+             "Prefix with 'lite' (e.g. 'adb lite' / 'adb lite local') for a glanceable offline summary card.",
     )
     ap.add_argument(
         "--sync", action="store_true",
@@ -1514,7 +1845,15 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    claude, codex, grok, per_machine = load_all(args.machines, sync=args.sync)
+    # 'lite' is a leading pseudo-subcommand over the machines positional (there is
+    # no subparser router): strip it, keep the rest as machine scope (default all),
+    # and skip the rate-limit network fetch so the glance stays offline/instant.
+    machines = list(args.machines)
+    lite = bool(machines) and machines[0] == "lite"
+    if lite:
+        machines = machines[1:] or ["all"]
+
+    claude, codex, grok, per_machine = load_all(machines, sync=args.sync, fetch_rate_limits=not lite)
     stats_list = [s for s in (claude, codex, grok) if s is not None]
     if not stats_list:
         print("No usage data found.")
@@ -1522,15 +1861,18 @@ def main() -> None:
     # The floor (lifetime high-water) applies to the FULL scope — local + every
     # remote — however requested (["all"], or local + all hosts named explicitly).
     _remotes = set(_load_remote_hosts())
-    if args.machines == ["all"]:
+    if machines == ["all"]:
         is_full = True
-    elif args.machines == ["local"]:
+    elif machines == ["local"]:
         is_full = not _remotes
     else:
-        is_full = _remotes.issubset(set(args.machines))
+        is_full = _remotes.issubset(set(machines))
     if args.rebaseline and not is_full:
         console.print("[yellow]--rebaseline ignored: it applies only to the full all-machines run.[/yellow]")
-    print_stats(claude, codex, grok, per_machine, apply_floor=is_full, rebaseline=args.rebaseline and is_full)
+    if lite:
+        print_lite(claude, codex, grok, apply_floor=is_full, rebaseline=args.rebaseline and is_full)
+    else:
+        print_stats(claude, codex, grok, per_machine, apply_floor=is_full, rebaseline=args.rebaseline and is_full)
 
 
 if __name__ == "__main__":

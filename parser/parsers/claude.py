@@ -1043,12 +1043,17 @@ def parse(
     stats_path: Path = STATS,
     history_path: Path = HISTORY,
     projects_base = PROJECTS_BASE,
+    fetch_rate_limits: bool = True,
 ) -> ToolStats | None:
     """Parse Claude Code stats. Returns None if no data available.
 
     stats-cache.json is optional: when absent/unreadable we fall back to an empty
     stats dict and derive everything from the session JSONL, so a missing meta file
     can never silently drop a host's entire token total.
+
+    fetch_rate_limits: when False, skip the Anthropic OAuth network call entirely
+    (the tier label is still read from local Keychain creds). The lite view sets
+    this so its glance stays offline and instant.
     """
     st: dict = {}
     if stats_path.exists():
@@ -1219,7 +1224,7 @@ def parse(
 
     # Credentials and rate limits
     cr_data = _get_creds()
-    rate_limits = _fetch_rate_limits(cr_data) if cr_data else []
+    rate_limits = _fetch_rate_limits(cr_data) if (cr_data and fetch_rate_limits) else []
     tier = _get_tier(cr_data)
 
     # Longest session
