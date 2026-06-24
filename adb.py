@@ -1765,6 +1765,16 @@ def print_lite(
     _urow("Today", t_tok, t_cost, _trend(t_cost, y_cost), _dash, _r.today)
     _urow("Week", w_tok, w_cost, _trend(w_cost, pw_cost), Text(f"~{fmt_cost_compact(proj_week)}", style=DIM), _r.week)
     _urow("Month", m_tok, m_cost, _trend(m_cost, pm_cost), Text(f"~{fmt_cost_compact(proj_month)}", style=DIM), _r.month)
+    # Lifetime total — exact floor-guarded tokens / real cost / exact msg+call
+    # counts (not window estimates), so no "~"; bold label sets it apart as the sum.
+    usage.add_row(
+        Text("Total", style="bold bright_white"),
+        Text(fmt_tokens(int(lifetime_display)), style=TOK),
+        Text(fmt_cost_compact(total_cost), style=ACCENT),
+        _dash, _dash,
+        Text(fmt_tokens(combined.total_messages), style=GREY),
+        Text(fmt_tokens(combined.total_tool_calls), style=GREY),
+    )
 
     # Lifetime — colored stacked bars for token make-up and model mix.
     _cache_tok = _tb.cache_read_tokens + _tb.cache_write_tokens
