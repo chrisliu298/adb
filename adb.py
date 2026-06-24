@@ -1573,14 +1573,15 @@ def print_lite(
     """Glanceable spend pulse — the lite view.
 
     A thin formatter over the same merged ToolStats the full dashboard uses,
-    wrapped in one rounded grey30 panel and structured by whitespace (no
-    dividers): a hero band of three stat tiles (lifetime tokens, spend, streak)
-    each with a 30-day sparkline or per-day pace; an Agents band (token-share
-    gauge, tokens, cost, tier); a one-line Usage band (today/week/month spend +
-    trend vs the prior window); a one-line Lifetime band (cache/in/out make-up
-    bar + top model mix); and a context footer (per-day, month projection,
-    per-session). No network (rate limits are skipped upstream via
-    load_all(fetch_rate_limits=False)); none of the six analytical sections.
+    wrapped in one rounded grey30 panel as a stack of square-boxed rows (every
+    row is its own box, all sharing the grey30 / left-title style): a hero row of
+    three stat tiles (lifetime tokens, spend, streak) each with a 30-day sparkline
+    or per-day pace; an AGENTS box (token-share gauge, tokens, cost, tier); a row
+    of two side-by-side boxes — USAGE (window · spend · tokens) and LIFETIME
+    (make-up · tokens · % of total), the same 3×3 shape so they match; and a PACE
+    box (per-day, month projection, per-session, top-1% concentration). No network
+    (rate limits are skipped upstream via load_all(fetch_rate_limits=False)); none
+    of the six analytical sections.
     """
     stats_list = [s for s in (claude, codex, grok) if s is not None]
     if not stats_list:
@@ -1618,12 +1619,6 @@ def print_lite(
     avg_tok = lifetime_display / days_active if days_active else 0
 
     y_tok = _r.yesterday[3] * tok_ratio
-
-    # Lifetime model-family mix (cumulative — labeled as such), reusing the full
-    # dashboard's family rollup so the labels match.
-    merged_models = {m: (tb, combined.model_costs.get(m, 0.0)) for m, tb in combined.models.items()}
-    families = sorted(_family_summaries(merged_models), key=lambda f: -f.tb.total)
-    top_fams = [f for f in families if f.tb.total > 0][:3]
 
     # Lifetime session-size spread — surfaces a runaway session.
     sess_toks = combined.session_tokens
@@ -1677,12 +1672,6 @@ def print_lite(
                 t.append("█" * w, style=c)
         return t
 
-    def _fam_color(name: str) -> str:
-        if name.startswith("Claude"): return "#d77757"
-        if name.startswith("GPT"):    return "#39c5cf"
-        if name.startswith("Grok"):   return "#c0c0c0"
-        return "grey58"
-
     def _resample(series: list[float], n: int) -> list[float]:
         """Bucket-average a series down to n points (for the narrow card sparklines)."""
         if n <= 0 or not series:
@@ -1713,30 +1702,30 @@ def print_lite(
     def _sep() -> Text:
         return Text(" · ", style=SEP)
 
-    # Usage — Today / Week / Month spend + tokens, one tight line.
-    usage = Text()
-    for i, (label, cost, tok) in enumerate(
-        (("Today", t_cost, t_tok), ("Week", w_cost, w_tok), ("Month", m_cost, m_tok))
-    ):
-        if i:
-            usage.append_text(_sep())
-        usage.append(f"{label} ", style=DIM)
-        usage.append(f"~{_kc(cost)} ", style=ACCENT)
-        usage.append(fmt_tokens(int(tok)), style=TOK)
-
-    # Lifetime — token make-up + top model mix, one tight line.
+    # Usage + Lifetime render as two boxed bands (a row of two, tiled like the
+    # hero row). Both are the same 3-row / 3-column shape so the boxes match:
+    # USAGE is window · spend · tokens; LIFETIME is make-up · tokens · % of total.
+    usage_rows = [
+        ("Today", f"~{_kc(t_cost)}", fmt_tokens(int(t_tok))),
+        ("Week",  f"~{_kc(w_cost)}", fmt_tokens(int(w_tok))),
+        ("Month", f"~{_kc(m_cost)}", fmt_tokens(int(m_tok))),
+    ]
     _cache_tok = _tb.cache_read_tokens + _tb.cache_write_tokens
-    life = Text()
-    for i, (lbl, tok, col) in enumerate(
-        (("cache", _cache_tok, CACHE_C), ("in", _tb.input_tokens, IN_C), ("out", _tb.output_tokens, OUT_C))
-    ):
-        if i:
-            life.append_text(_sep())
-        life.append(f"{lbl} {fmt_tokens(tok)}", style=col)
-    for f in top_fams[:2]:
-        life.append_text(_sep())
-        name = f.name.replace("Claude ", "").replace("GPT-5", "GPT")
-        life.append(f"{name} {f.tb.total / raw_total_tokens * 100:.0f}%", style=_fam_color(f.name))
+    _mk_total = (_cache_tok + _tb.input_tokens + _tb.output_tokens) or 1
+    life_rows = [
+        ("cache", fmt_tokens(_cache_tok), f"{_cache_tok / _mk_total * 100:.0f}%", CACHE_C),
+        ("in",    fmt_tokens(_tb.input_tokens), f"{_tb.input_tokens / _mk_total * 100:.0f}%", IN_C),
+        ("out",   fmt_tokens(_tb.output_tokens), f"{_tb.output_tokens / _mk_total * 100:.0f}%", OUT_C),
+    ]
+
+    # Inner content width each band needs: label + 1-space gaps + value columns.
+    _u_w = (max(len(l) for l, _, _ in usage_rows) + 1
+            + max(len(c) for _, c, _ in usage_rows) + 1
+            + max(len(t) for _, _, t in usage_rows))
+    _l_w = (max(len(l) for l, _, _, _ in life_rows) + 1
+            + max(len(v) for _, v, _, _ in life_rows) + 1
+            + max(len(p) for _, _, p, _ in life_rows))
+    band_w = max(_u_w, _l_w) + 4  # + box border (2) + padding (2)
 
     # Footer — the spend pulse + spend concentration (top 1% of sessions' share),
     # one tight line.
@@ -1757,9 +1746,21 @@ def print_lite(
             foot.append_text(_sep())
         foot.append(txt, style=st)
 
-    # Inner width = the widest tight band, floored at a 3-card minimum and snapped
-    # to exactly 3·card_w + 2 gaps so the cards tile it with no leftover gutter.
-    needed = max(50, usage.cell_len, life.cell_len, foot.cell_len)
+    # Agents-band tier column width (computed here so it can size the panel too).
+    # +2 so a full-width tier ("Max 20x") keeps a ~2-cell gap off the $cost column.
+    agent_rows = []
+    for s in stats_list:
+        tier = s.extra.get("tier", "")
+        tstr = f"{tier[:1].upper()}{tier[1:]}" if tier else ""
+        share = s.total_tokens.total / raw_total_tokens * 100 if raw_total_tokens else 0
+        agent_rows.append((s, tstr, share))
+    tier_w = (max((len(t) for _, t, _ in agent_rows), default=0) or 1) + 2
+
+    # Inner width = the widest band, floored at a 3-card minimum and snapped to
+    # exactly 3·card_w + 2 gaps so the hero cards tile it with no leftover gutter.
+    # Every row is boxed (border+padding = 4): the footer text, the two side-by-side
+    # bands (2·band_w+1), and the AGENTS table (40+tier_w inner) must each fit.
+    needed = max(50, foot.cell_len + 4, 2 * band_w + 1, 44 + tier_w)
     card_w = min(22, max(16, -(-(needed - 2) // 3)))
     IW = card_w * 3 + 2
     spark_w = card_w - 4
@@ -1784,18 +1785,9 @@ def print_lite(
     )
 
     # Agents — the share gauge grows to fill the row (tokens / cost / tier tight),
-    # so the band fills the width with a bar instead of an empty gutter.
-    rows = []
-    for s in stats_list:
-        tier = s.extra.get("tier", "")
-        tstr = f"{tier[:1].upper()}{tier[1:]}" if tier else ""
-        share = s.total_tokens.total / raw_total_tokens * 100 if raw_total_tokens else 0
-        rows.append((s, tstr, share))
-    # +2 so the tier column carries the same ~2-cell leading space the right-
-    # justified tokens/cost columns get from their slack — otherwise a full-width
-    # tier ("Max 20x") butts right up against $cost with only the 1 padding cell.
-    tier_w = (max((len(t) for _, t, _ in rows), default=0) or 1) + 2
-    bar_w = max(8, IW - 7 - 4 - 8 - 8 - tier_w - 5)  # name·pct·tok·cost·tier + 5 gaps
+    # so the band fills the width with a bar instead of an empty gutter. The table
+    # is sized to the AGENTS box's inner width (IW − 4 for its border + padding).
+    bar_w = max(8, IW - 4 - 7 - 4 - 8 - 8 - tier_w - 5)  # name·pct·tok·cost·tier + 5 gaps
     agents = Table(box=None, padding=(0, 1, 0, 0), show_header=False, pad_edge=False)
     agents.add_column(style="bold", no_wrap=True, width=7)                  # name
     agents.add_column(no_wrap=True, width=bar_w)                            # share gauge
@@ -1803,7 +1795,7 @@ def print_lite(
     agents.add_column(justify="right", no_wrap=True, width=8)               # tokens
     agents.add_column(justify="right", no_wrap=True, width=8)               # cost
     agents.add_column(justify="right", style=DIM, no_wrap=True, width=tier_w)  # tier
-    for s, tstr, share in rows:
+    for s, tstr, share in agent_rows:
         color = TOOL_COLORS.get(s.source, GREY)
         agents.add_row(
             Text(TOOL_NAMES.get(s.source, s.source.title()), style=color),
@@ -1814,14 +1806,56 @@ def print_lite(
             tstr,
         )
 
-    # One rounded panel pinned to the compact width — bands are tight and
-    # left-packed, so neither a wide terminal nor short rows leave a big gutter.
-    body = Group(cards, Text(""), agents, Text(""), usage, life, Text(""), foot)
+    def _band(title: str, content, width: int | None = None) -> Panel:
+        return Panel(
+            content, box=box.SQUARE, border_style="grey30", width=width, padding=(0, 1),
+            title=Text(title, style=DIM), title_align="left",
+        )
+
+    # Two boxed bands tiling IW (a row of two, like the hero row): USAGE
+    # (window · spend · tokens) and LIFETIME (make-up · tokens · % of total).
+    # Same 3×3 shape so the boxes match — no filler row, equal height. expand=True
+    # + ratio=1 on the label column spreads each row across the full box width:
+    # the label stretches left, pushing the figures to the right edge (no gutter).
+    usage_tbl = Table(box=None, show_header=False, pad_edge=False, padding=(0, 1, 0, 0), expand=True)
+    usage_tbl.add_column(style=DIM, no_wrap=True, ratio=1)    # window (absorbs slack)
+    usage_tbl.add_column(justify="right", no_wrap=True)       # spend
+    usage_tbl.add_column(justify="right", no_wrap=True)       # tokens
+    for label, cost, tok in usage_rows:
+        usage_tbl.add_row(label, Text(cost, style=ACCENT), Text(tok, style=TOK))
+
+    life_tbl = Table(box=None, show_header=False, pad_edge=False, padding=(0, 1, 0, 0), expand=True)
+    life_tbl.add_column(no_wrap=True, ratio=1)               # make-up label (absorbs slack)
+    life_tbl.add_column(justify="right", no_wrap=True)        # tokens
+    life_tbl.add_column(justify="right", style=DIM, no_wrap=True)  # % of total
+    for lbl, val, pct, col in life_rows:
+        life_tbl.add_row(Text(lbl, style=col), Text(val, style=col), pct)
+
+    left_w = (IW - 1) // 2
+    right_w = IW - 1 - left_w
+    bands = Table(box=None, padding=(0, 1, 0, 0), show_header=False, pad_edge=False)
+    bands.add_column(no_wrap=True)
+    bands.add_column(no_wrap=True)
+    bands.add_row(
+        _band("USAGE", usage_tbl, left_w),
+        _band("LIFETIME", life_tbl, right_w),
+    )
+
+    # Every row is its own box now: hero cards (3-up), AGENTS, the USAGE/LIFETIME
+    # pair, and PACE (the footer). Boxes stack flush (no blank separators) so the
+    # card stays compact; the full-width boxes span IW; one rounded panel pins the
+    # whole card to the compact width.
+    body = Group(
+        cards,
+        _band("AGENTS", agents, IW),
+        bands,
+        _band("PACE", foot, IW),
+    )
     console.print()
     console.print(Panel(
         body, box=box.ROUNDED, border_style="grey30",
         title="[bold bright_white]adb · lite[/]", title_align="left",
-        width=IW + 6, padding=(1, 2),
+        width=IW + 6, padding=(0, 2),
     ))
     console.print()
 
