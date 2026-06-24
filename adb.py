@@ -18,7 +18,6 @@ from rich import box
 from rich.align import Align
 from rich.console import Console, Group
 from rich.panel import Panel
-from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
@@ -1574,14 +1573,14 @@ def print_lite(
     """Glanceable spend pulse — the lite view.
 
     A thin formatter over the same merged ToolStats the full dashboard uses,
-    tokens-forward, wrapped in one rounded grey30 panel matching the dashboard's
-    aesthetic with labeled Rule dividers: a hero (lifetime tokens · cost ·
-    streak); 30-day token & spend sparklines; an Agents band (token-share bar,
-    tokens, cost, cache-hit %, tier); a Usage band (yest/today/week/month tokens,
-    spend, trend, pace + today's exact activity counts); a Lifetime band (token
-    make-up, model mix, session-size spread); and a context footer. No network
-    (rate limits are skipped upstream via load_all(fetch_rate_limits=False));
-    none of the six analytical sections.
+    wrapped in one rounded grey30 panel and structured by whitespace (no
+    dividers): a hero band of three stat tiles (lifetime tokens, spend, streak)
+    each with a 30-day sparkline or per-day pace; an Agents band (token-share
+    gauge, tokens, cost, tier); a one-line Usage band (today/week/month spend +
+    trend vs the prior window); a one-line Lifetime band (cache/in/out make-up
+    bar + top model mix); and a context footer (per-day, month projection,
+    per-session). No network (rate limits are skipped upstream via
+    load_all(fetch_rate_limits=False)); none of the six analytical sections.
     """
     stats_list = [s for s in (claude, codex, grok) if s is not None]
     if not stats_list:
@@ -1671,13 +1670,12 @@ def print_lite(
 
     IN_C, OUT_C, CACHE_C = "#af87d7", "#87d7af", "#5f87d7"  # match the full Cost section
 
-    def _share_bar(pct: float, color: str) -> Text:
-        """A 10-wide proportion bar in the tool's color (no track) + the percent."""
-        fill = max(0, min(10, int(round(pct / 100 * 10))))
+    def _share_bar(pct: float, color: str, width: int = 10) -> Text:
+        """A proportion gauge in the tool's color over a faint track (no percent)."""
+        fill = max(0, min(width, int(round(pct / 100 * width))))
         t = Text()
         t.append("█" * fill, style=color)
-        t.append(" " * (10 - fill))
-        t.append(f" {pct:>3.0f}%", style=GREY)
+        t.append("░" * (width - fill), style="grey30")
         return t
 
     def _stack_bar(parts: list[tuple[float, str]], width: int = 18) -> Text:
@@ -1700,135 +1698,142 @@ def print_lite(
         if name.startswith("Grok"):   return "#c0c0c0"
         return "grey58"
 
-    def _div(label: str) -> Rule:
-        return Rule(Text(f" {label} ", style=DIM), characters="─", style="grey30", align="left")
+    def _resample(series: list[float], n: int) -> list[float]:
+        """Bucket-average a series down to n points (for the narrow card sparklines)."""
+        if n <= 0 or not series:
+            return []
+        if len(series) <= n:
+            return series
+        step = len(series) / n
+        out = []
+        for i in range(n):
+            lo, hi = int(i * step), (int((i + 1) * step) if i < n - 1 else len(series))
+            chunk = series[lo:hi] or series[lo:lo + 1]
+            out.append(sum(chunk) / len(chunk))
+        return out
 
-    # Hero — lifetime tokens lead (floor-guarded) · exact cost · streak.
-    hero = Text.assemble(
-        (f"{fmt_tokens(lifetime_display)} tok", TOK), ("   ·   ", SEP),
-        (fmt_cost(total_cost), f"bold {ACCENT}"), ("   ·   ", SEP),
-        (f"{streak}d streak \U0001f525", GREY),
+    # --- Compact layout ----------------------------------------------------
+    # Tight, left-packed bands sized to a NARROW inner width. No expand/justify
+    # spreading (it strands big internal gaps) and no ballooning on a wide
+    # terminal (the panel is pinned to the compact content width). Money is
+    # K/M-compacted and the lifetime make-up bar is dropped to keep lines short.
+    def _kc(c: float) -> str:
+        """Very compact money for tight bands: $9.9K · $1.2M · $740."""
+        if c >= 1_000_000:
+            return f"${c / 1_000_000:.1f}M"
+        if c >= 1_000:
+            return f"${c / 1_000:.1f}K"
+        return f"${c:,.0f}"
+
+    def _sep() -> Text:
+        return Text(" · ", style=SEP)
+
+    # Usage — Today / Week / Month spend + trend, one tight line.
+    usage = Text()
+    for i, (label, cost, prev) in enumerate(
+        (("Today", t_cost, y_cost), ("Week", w_cost, pw_cost), ("Month", m_cost, pm_cost))
+    ):
+        if i:
+            usage.append_text(_sep())
+        usage.append(f"{label} ", style=DIM)
+        usage.append(f"~{_kc(cost)} ", style=ACCENT)
+        usage.append_text(_trend(cost, prev))
+
+    # Lifetime — token make-up + top model mix, one tight line.
+    _cache_tok = _tb.cache_read_tokens + _tb.cache_write_tokens
+    life = Text()
+    for i, (lbl, tok, col) in enumerate(
+        (("cache", _cache_tok, CACHE_C), ("in", _tb.input_tokens, IN_C), ("out", _tb.output_tokens, OUT_C))
+    ):
+        if i:
+            life.append_text(_sep())
+        life.append(f"{lbl} {fmt_tokens(tok)}", style=col)
+    for f in top_fams[:2]:
+        life.append_text(_sep())
+        name = f.name.replace("Claude ", "").replace("GPT-5", "GPT")
+        life.append(f"{name} {f.tb.total / raw_total_tokens * 100:.0f}%", style=_fam_color(f.name))
+
+    # Footer — the spend pulse + spend concentration (top 1% of sessions' share),
+    # one tight line.
+    avg_sess_cost = sum(sess_costs) / len(sess_costs) if sess_costs else 0.0
+    sc = sorted(sess_costs)
+    top1 = 0.0
+    if sc and sum(sc) > 0:
+        top1 = sum(sc[-max(1, int(0.01 * len(sc))):]) / sum(sc) * 100
+    foot = Text()
+    for i, (txt, st) in enumerate((
+        (f"{days_active}d active", GREY),
+        (f"{_kc(avg_cost)}/d", f"bold {ACCENT}"),
+        (f"~{_kc(proj_month)}/mo", DIM),
+        (f"{_kc(avg_sess_cost)}/sess", ACCENT),
+        (f"top1% {top1:.0f}%", GREY),
+    )):
+        if i:
+            foot.append_text(_sep())
+        foot.append(txt, style=st)
+
+    # Inner width = the widest tight band, floored at a 3-card minimum and snapped
+    # to exactly 3·card_w + 2 gaps so the cards tile it with no leftover gutter.
+    needed = max(50, usage.cell_len, life.cell_len, foot.cell_len)
+    card_w = min(22, max(16, -(-(needed - 2) // 3)))
+    IW = card_w * 3 + 2
+    spark_w = card_w - 4
+
+    def _card(title: str, value: str, vstyle: str, sub) -> Panel:
+        """A boxed hero stat: bold figure on top, a sparkline/subtitle beneath."""
+        sub_r = sub if isinstance(sub, Text) else Text(str(sub), style=GREY)
+        return Panel(
+            Group(Text(value, style=vstyle, no_wrap=True, overflow="crop"), sub_r),
+            box=box.SQUARE, border_style="grey30", width=card_w, padding=(0, 1),
+            title=Text(title, style=DIM), title_align="left",
+        )
+
+    # Hero band — three equal stat tiles tiling the full width.
+    cards = Table(box=None, padding=(0, 1, 0, 0), show_header=False, pad_edge=False)
+    for _ in range(3):
+        cards.add_column(no_wrap=True)
+    cards.add_row(
+        _card("TOKENS", fmt_tokens(lifetime_display), "bold bright_white", _sparkline(_resample(tok_series, spark_w))),
+        _card("SPEND", f"${total_cost:,.0f}", f"bold {ACCENT}", _sparkline(_resample(cost_series, spark_w))),
+        _card("STREAK", f"{streak} days \U0001f525", "bold #d7875f", f"{fmt_tokens(int(avg_tok))} tok/d"),
     )
 
-    # 30-day trend sparklines (tokens shape from daily output; spend exact).
-    spark_tok = Text.assemble(("tokens 30d  ", DIM), _sparkline(tok_series), (f"  today ~{fmt_tokens(int(t_tok))}", TOK))
-    spark_cost = Text.assemble(("spend  30d  ", DIM), _sparkline(cost_series), (f"  today ~{fmt_cost_compact(t_cost)}", ACCENT))
-
-    # Agents + Usage share one column grid (label/tokens/cost align across both).
-    def _grid() -> Table:
-        t = Table(box=None, padding=(0, 2, 0, 0), header_style=DIM)
-        t.add_column("", style="bold", no_wrap=True, width=7)
-        t.add_column("Tokens", justify="right", no_wrap=True, width=7)
-        t.add_column("Cost", justify="right", no_wrap=True, width=7)
-        t.add_column("Cache", justify="right", no_wrap=True, width=6)
-        return t
-
-    agents = _grid()
-    agents.add_column("Share", no_wrap=True)
-    agents.add_column("Tier", style=DIM, no_wrap=True)
+    # Agents — the share gauge grows to fill the row (tokens / cost / tier tight),
+    # so the band fills the width with a bar instead of an empty gutter.
+    rows = []
     for s in stats_list:
         tier = s.extra.get("tier", "")
-        tier_str = f"{tier[:1].upper()}{tier[1:]}" if tier else ""
+        tstr = f"{tier[:1].upper()}{tier[1:]}" if tier else ""
         share = s.total_tokens.total / raw_total_tokens * 100 if raw_total_tokens else 0
-        cp = _cache_pct(s.total_tokens)
+        rows.append((s, tstr, share))
+    tier_w = max((len(t) for _, t, _ in rows), default=0) or 1
+    bar_w = max(8, IW - 7 - 4 - 8 - 8 - tier_w - 5)  # name·pct·tok·cost·tier + 5 gaps
+    agents = Table(box=None, padding=(0, 1, 0, 0), show_header=False, pad_edge=False)
+    agents.add_column(style="bold", no_wrap=True, width=7)                  # name
+    agents.add_column(no_wrap=True, width=bar_w)                            # share gauge
+    agents.add_column(justify="right", no_wrap=True, width=4)               # share %
+    agents.add_column(justify="right", no_wrap=True, width=8)               # tokens
+    agents.add_column(justify="right", no_wrap=True, width=8)               # cost
+    agents.add_column(justify="right", style=DIM, no_wrap=True, width=tier_w)  # tier
+    for s, tstr, share in rows:
         color = TOOL_COLORS.get(s.source, GREY)
         agents.add_row(
             Text(TOOL_NAMES.get(s.source, s.source.title()), style=color),
+            _share_bar(share, color, bar_w),
+            Text(f"{share:.0f}%", style=GREY),
             Text(fmt_tokens(s.total_tokens.total), style=TOK),
             Text(fmt_cost_compact(s.total_cost), style=ACCENT),
-            Text(f"{cp:.0f}%", style=GREY) if cp is not None else Text("—", style=DIM),
-            _share_bar(share, color),
-            tier_str,
+            tstr,
         )
 
-    # Usage — yesterday/today/week/month. Token/spend are estimates → "~"; the
-    # message/call counts (right) are exact per-window DayActivity sums.
-    usage = _grid()
-    usage.columns[2].header = "Spend"
-    usage.columns[3].header = "Trend"
-    usage.add_column("Pace", justify="right", no_wrap=True, width=8)
-    usage.add_column("Msgs", justify="right", no_wrap=True, width=6)
-    usage.add_column("Calls", justify="right", no_wrap=True, width=6)
-
-    def _urow(label, otok, cost, trend, pace, window):
-        usage.add_row(
-            label,
-            Text(f"~{fmt_tokens(int(otok))}", style=TOK),
-            Text(f"~{fmt_cost_compact(cost)}", style=ACCENT),
-            trend, pace,
-            Text(fmt_tokens(window[0]), style=GREY),
-            Text(fmt_tokens(window[2]), style=GREY),
-        )
-
-    _dash = Text("—", style=DIM)
-    _urow("Yest", y_tok, y_cost, _dash, _dash, _r.yesterday)
-    _urow("Today", t_tok, t_cost, _trend(t_cost, y_cost), _dash, _r.today)
-    _urow("Week", w_tok, w_cost, _trend(w_cost, pw_cost), Text(f"~{fmt_cost_compact(proj_week)}", style=DIM), _r.week)
-    _urow("Month", m_tok, m_cost, _trend(m_cost, pm_cost), Text(f"~{fmt_cost_compact(proj_month)}", style=DIM), _r.month)
-    # Lifetime total — exact floor-guarded tokens / real cost / exact msg+call
-    # counts (not window estimates), so no "~"; bold label sets it apart as the sum.
-    usage.add_row(
-        Text("Total", style="bold bright_white"),
-        Text(fmt_tokens(int(lifetime_display)), style=TOK),
-        Text(fmt_cost_compact(total_cost), style=ACCENT),
-        _dash, _dash,
-        Text(fmt_tokens(combined.total_messages), style=GREY),
-        Text(fmt_tokens(combined.total_tool_calls), style=GREY),
-    )
-
-    # Lifetime — colored stacked bars for token make-up and model mix.
-    _cache_tok = _tb.cache_read_tokens + _tb.cache_write_tokens
-    tok_bar = _stack_bar([(_cache_tok, CACHE_C), (_tb.input_tokens, IN_C), (_tb.output_tokens, OUT_C)])
-    tok_legend = Text.assemble(
-        (f"cache {fmt_tokens(_cache_tok)}", CACHE_C), ("  ", None),
-        (f"in {fmt_tokens(_tb.input_tokens)}", IN_C), ("  ", None),
-        (f"out {fmt_tokens(_tb.output_tokens)}", OUT_C),
-    )
-    model_bar = _stack_bar([(f.tb.total, _fam_color(f.name)) for f in families if f.tb.total > 0])
-    model_legend = Text()
-    for i, f in enumerate(top_fams):
-        if i:
-            model_legend.append("  ")
-        model_legend.append(f"{f.name.replace('Claude ', '')} {f.tb.total / raw_total_tokens * 100:.0f}%", style=_fam_color(f.name))
-
-    detail = Table(box=None, show_header=False, padding=(0, 2, 0, 0))
-    detail.add_column("k", style=DIM, no_wrap=True, width=7)
-    detail.add_column("bar", no_wrap=True, width=18)
-    detail.add_column("v", no_wrap=True)
-    detail.add_row("tokens", tok_bar, tok_legend)
-    detail.add_row("models", model_bar, model_legend)
-
-    session_line = Text.assemble(
-        ("session  ", DIM),
-        (f"~{fmt_tokens(int(avg_sess_tok))} avg", GREY), ("  ·  ", SEP),
-        (f"{fmt_tokens(int(max_sess_tok))} max tok", "#d7875f"), ("  ·  ", SEP),
-        (f"{fmt_cost_compact(max_sess_cost)} max", "#d7875f"),
-    )
-
-    # Context footer — colored so the bottom isn't a wall of grey.
-    avg_sess_cost = sum(sess_costs) / len(sess_costs) if sess_costs else 0.0
-    ctx = Text.assemble(
-        (f"{days_active}d active", GREY), ("   ·   ", SEP),
-        (f"{fmt_tokens(int(avg_tok))} tok/d", TOK), ("   ·   ", SEP),
-        (f"{fmt_cost(avg_cost)}/d", f"bold {ACCENT}"), ("   ·   ", SEP),
-        (f"{fmt_cost_compact(avg_sess_cost)}/sess", ACCENT),
-    )
-
-    # One rounded panel — the dashboard's grey30 aesthetic, sized to content so it
-    # never wraps; labeled Rule dividers structure the bands.
-    body = Group(
-        hero, Text(""),
-        spark_tok, spark_cost, Text(""),
-        _div("Agents"), agents, Text(""),
-        _div("Usage"), usage, Text(""),
-        _div("Lifetime"), detail, session_line, Text(""),
-        ctx,
-    )
+    # One rounded panel pinned to the compact width — bands are tight and
+    # left-packed, so neither a wide terminal nor short rows leave a big gutter.
+    body = Group(cards, Text(""), agents, Text(""), usage, life, Text(""), foot)
     console.print()
     console.print(Panel(
         body, box=box.ROUNDED, border_style="grey30",
         title="[bold bright_white]adb · lite[/]", title_align="left",
-        expand=False, padding=(1, 2),
+        width=IW + 6, padding=(1, 2),
     ))
     console.print()
 

@@ -98,8 +98,8 @@ def test_print_lite_smoke(monkeypatch):
         print_lite(claude, None, None)
     out = cap.get()
 
-    for token in ("adb", "Claude", "Yest", "Today", "Week", "Month", "streak", "Max",
-                  "tok", "Tokens", "Share", "Cache", "today", "models", "session"):
+    for token in ("adb", "Claude", "TOKENS", "SPEND", "STREAK", "Today", "Week", "Month",
+                  "Max", "tok/d", "cache", "out", "active", "/mo", "/sess", "top1%"):
         assert token in out, f"{token!r} missing from lite output:\n{out}"
 
 
