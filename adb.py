@@ -1601,15 +1601,11 @@ def print_lite(
     _r = _compute_recent(daily_by_date, total_cost, total_output_tokens, today)
     cpt = _r.cost_per_token
     t_cost = _r.today[3] * cpt
-    y_cost = _r.yesterday[3] * cpt
     w_cost = _r.week[3] * cpt
     m_cost = _r.month[3] * cpt
     days_in_month = calendar.monthrange(today.year, today.month)[1]
     proj_week = w_cost / _r.n_week_days * 7 if _r.n_week_days else 0
     proj_month = m_cost / today.day * days_in_month if today.day else 0
-
-    pw_cost = _r.pw_otoks * cpt
-    pm_cost = _r.pm_otoks * cpt
 
     # Per-window TOTAL tokens are estimated by scaling that window's output tokens
     # by the lifetime total/output ratio — the same approximation the full RECENT
@@ -1651,17 +1647,6 @@ def print_lite(
     TOK = "bold grey85"
     TOOL_COLORS = {"claude": "#d77757", "codex": "#39c5cf", "grok": "#c0c0c0"}
     TOOL_NAMES = {"claude": "Claude", "codex": "Codex", "grok": "Grok"}
-
-    def _trend(cur: float, prev: float) -> Text:
-        """Bare ↑/↓ percent vs the prior period — clean enough for a table cell."""
-        if prev <= 0:
-            return Text("—", style=DIM)
-        pct = (cur - prev) / prev * 100
-        if pct > 0:
-            return Text(f"↑{pct:.0f}%", style="#5fd787")
-        if pct < 0:
-            return Text(f"↓{abs(pct):.0f}%", style="#d75f5f")
-        return Text("→0%", style=DIM)
 
     def _cache_pct(tb: TokenBreakdown) -> float | None:
         """Cache-read hit rate: cached input / all input. None when no input seen."""
@@ -1728,16 +1713,16 @@ def print_lite(
     def _sep() -> Text:
         return Text(" · ", style=SEP)
 
-    # Usage — Today / Week / Month spend + trend, one tight line.
+    # Usage — Today / Week / Month spend + tokens, one tight line.
     usage = Text()
-    for i, (label, cost, prev) in enumerate(
-        (("Today", t_cost, y_cost), ("Week", w_cost, pw_cost), ("Month", m_cost, pm_cost))
+    for i, (label, cost, tok) in enumerate(
+        (("Today", t_cost, t_tok), ("Week", w_cost, w_tok), ("Month", m_cost, m_tok))
     ):
         if i:
             usage.append_text(_sep())
         usage.append(f"{label} ", style=DIM)
         usage.append(f"~{_kc(cost)} ", style=ACCENT)
-        usage.append_text(_trend(cost, prev))
+        usage.append(fmt_tokens(int(tok)), style=TOK)
 
     # Lifetime — token make-up + top model mix, one tight line.
     _cache_tok = _tb.cache_read_tokens + _tb.cache_write_tokens
@@ -1806,7 +1791,10 @@ def print_lite(
         tstr = f"{tier[:1].upper()}{tier[1:]}" if tier else ""
         share = s.total_tokens.total / raw_total_tokens * 100 if raw_total_tokens else 0
         rows.append((s, tstr, share))
-    tier_w = max((len(t) for _, t, _ in rows), default=0) or 1
+    # +2 so the tier column carries the same ~2-cell leading space the right-
+    # justified tokens/cost columns get from their slack — otherwise a full-width
+    # tier ("Max 20x") butts right up against $cost with only the 1 padding cell.
+    tier_w = (max((len(t) for _, t, _ in rows), default=0) or 1) + 2
     bar_w = max(8, IW - 7 - 4 - 8 - 8 - tier_w - 5)  # name·pct·tok·cost·tier + 5 gaps
     agents = Table(box=None, padding=(0, 1, 0, 0), show_header=False, pad_edge=False)
     agents.add_column(style="bold", no_wrap=True, width=7)                  # name
