@@ -34,6 +34,7 @@ CACHE_READ_MULTIPLIER = 0.1
 CACHE_WRITE_5M_MULTIPLIER = 1.25
 CACHE_WRITE_1H_MULTIPLIER = 2.0
 PRICE: dict[str, list[float]] = {
+    "fable-5": [10, 50],
     "opus-4-8": [5, 25],
     "opus-4-7": [5, 25],
     "opus-4-6": [5, 25],
