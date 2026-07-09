@@ -71,6 +71,23 @@ MODEL_PRICING: dict[str, ModelPricing] = {
         cached_input_usd_per_mtok=0.50,
         output_usd_per_mtok=30.0,
     ),
+    # gpt-5.6 tiers: gpt-5.6-<tier>-codex normalizes to gpt-5.6-<tier>.
+    # Luna (cheapest) / Terra (value) / Sol (most capable).
+    "gpt-5.6-luna": ModelPricing(
+        input_usd_per_mtok=1.00,
+        cached_input_usd_per_mtok=0.10,
+        output_usd_per_mtok=6.0,
+    ),
+    "gpt-5.6-terra": ModelPricing(
+        input_usd_per_mtok=2.50,
+        cached_input_usd_per_mtok=0.25,
+        output_usd_per_mtok=15.0,
+    ),
+    "gpt-5.6-sol": ModelPricing(
+        input_usd_per_mtok=5.00,
+        cached_input_usd_per_mtok=0.50,
+        output_usd_per_mtok=30.0,
+    ),
     # gpt-5.3-codex-spark doesn't match any strip rule, stays as-is. No official
     # API pricing yet, so it's priced the same as gpt-5.3-codex (-> gpt-5.3).
     "gpt-5.3-codex-spark": ModelPricing(
