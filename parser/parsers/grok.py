@@ -48,6 +48,9 @@ class ModelPricing:
 
 # grok-build-0.1: xAI official pricing (docs.x.ai/developers/pricing). Tiered:
 # <=200K context at $1/$0.20/$2, >200K at $2/$0.40/$4.
+# grok-4.5: xAI official pricing (docs.x.ai/developers/pricing), flat
+# $2/$6 in/out, 500K context, no long-context tier. xAI publishes no separate
+# cached-input rate for it, so cache is left unset (unused for cost anyway).
 # grok-composer-2.5-fast: xAI publishes no per-token rate for the Grok CLI
 # route; this is the Cursor Composer 2.5 "fast" tier as a NOTIONAL proxy, not a
 # billed rate. These constants are the single place to adjust cost.
@@ -58,6 +61,11 @@ MODEL_PRICING: dict[str, ModelPricing] = {
         output_usd_per_mtok=2.0,
         long_ctx_threshold=200_000,
         input_usd_per_mtok_long=2.0,
+    ),
+    "grok-4.5": ModelPricing(
+        input_usd_per_mtok=2.0,
+        cached_input_usd_per_mtok=None,
+        output_usd_per_mtok=6.0,
     ),
     "grok-composer-2.5-fast": ModelPricing(
         input_usd_per_mtok=3.0,
