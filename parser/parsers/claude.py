@@ -54,6 +54,7 @@ PRICE: dict[str, list[float]] = {
     "minimax-m3": [0.6, 2.4],
     "kimi-k2.6": [0.95, 4.0],
     "kimi-k2.7-code": [0.95, 4.0],
+    "kimi-k3": [3.0, 15.0],
     "glm-5.2": [1.4, 4.4],
 }
 
@@ -78,6 +79,10 @@ CACHE_OVERRIDES: dict[str, tuple[float, float, float]] = {
     # Kimi K2.7 Code keeps K2.6's input/output rates but bumps the cache-hit
     # price to $0.19/MTok; no cache-write premium, so writes price at input.
     "kimi-k2.7-code": (0.19, 0.95, 0.95),
+    # Kimi K3 publishes an explicit cache-hit price ($0.30/MTok) and no
+    # cache-write premium, so writes price at the cache-miss (input) rate. The
+    # override still applies: only the read rate coincides with the default.
+    "kimi-k3": (0.30, 3.0, 3.0),
     # GLM-5.2 (Z.AI direct API) publishes a cached-input price ($0.26/MTok) and
     # no cache-write premium, so writes price at the cache-miss (input) rate.
     "glm-5.2": (0.26, 1.4, 1.4),

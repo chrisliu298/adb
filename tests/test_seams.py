@@ -46,6 +46,24 @@ def test_claude_sonnet_5_introductory_pricing():
     assert _msg_cost("claude-sonnet-5", usage) == 18.7
 
 
+def test_claude_kimi_k3_pricing():
+    assert _pkey("kimi-k3") == "kimi-k3"
+    assert PRICE["kimi-k3"] == [3.0, 15.0]
+    usage = {
+        "input_tokens": 1_000_000,
+        "output_tokens": 1_000_000,
+        "cache_read_input_tokens": 1_000_000,
+        "cache_creation_input_tokens": 2_000_000,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": 1_000_000,
+            "ephemeral_1h_input_tokens": 1_000_000,
+        },
+    }
+    # $3 input, $15 output, $0.30 cache hit; both cache-write buckets price at
+    # the cache-miss rate ($3 each), since Kimi charges no cache-write premium.
+    assert _msg_cost("kimi-k3", usage) == 24.3
+
+
 def test_pricing_exact_spark():
     assert _pricing_for("gpt-5.3-codex-spark") is MODEL_PRICING["gpt-5.3-codex-spark"]
 
