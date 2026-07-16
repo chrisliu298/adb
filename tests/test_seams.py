@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from parser.parsers.claude import _iter_session_files  # noqa: E402
+from parser.parsers.claude import PRICE, _iter_session_files, _msg_cost, _pkey  # noqa: E402
 from parser.parsers.codex import MODEL_PRICING, _pricing_for  # noqa: E402
 
 
@@ -26,6 +26,24 @@ def test_iter_session_files_skips_audit():
         (proj / "audit.jsonl").write_text("{}\n")
         names = {f.name for f in _iter_session_files(proj)}
     assert names == {"abc.jsonl"}, names
+
+
+def test_claude_sonnet_5_introductory_pricing():
+    assert _pkey("claude-sonnet-5") == "sonnet-5"
+    assert PRICE["sonnet-5"] == [2, 10]
+    usage = {
+        "input_tokens": 1_000_000,
+        "output_tokens": 1_000_000,
+        "cache_read_input_tokens": 1_000_000,
+        "cache_creation_input_tokens": 2_000_000,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": 1_000_000,
+            "ephemeral_1h_input_tokens": 1_000_000,
+        },
+    }
+    # Introductory rates through 2026-08-31: $2 input, $10 output;
+    # standard cache multipliers give $0.20 read, $2.50 5m, and $4 1h.
+    assert _msg_cost("claude-sonnet-5", usage) == 18.7
 
 
 def test_pricing_exact_spark():

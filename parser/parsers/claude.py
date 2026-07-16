@@ -39,6 +39,9 @@ PRICE: dict[str, list[float]] = {
     "opus-4-7": [5, 25],
     "opus-4-6": [5, 25],
     "opus-4-5": [5, 25],
+    # Anthropic introductory pricing through 2026-08-31; standard pricing
+    # becomes $3/MTok input and $15/MTok output afterward.
+    "sonnet-5": [2, 10],
     "sonnet-4-6": [3, 15],
     "sonnet-4-5": [3, 15],
     "haiku-4-5": [1, 5],
@@ -455,8 +458,9 @@ def _load_projects_from_sessions(
     base_key = "|".join(str(b) for b in bases)
     base_hash = hashlib.md5(base_key.encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    # v4: per-file cache now also stores per-session total tokens ("t").
-    cache_path = cache_dir / f"claude-projects4-{base_hash}.json"
+    # v5: invalidate cached per-session costs for Claude Sonnet 5 pricing.
+    # v4 added per-session total tokens ("t").
+    cache_path = cache_dir / f"claude-projects5-{base_hash}.json"
     cache = _load_cache(cache_path)
     cache_dirty = False
 
@@ -923,10 +927,10 @@ def _build_daily_from_sessions(
     dirs_str = ":".join(sorted(str(d) for d in projects_dirs))
     dirs_hash = hashlib.md5(dirs_str.encode()).hexdigest()[:12]
     cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache"
-    # v7: day_str [0] is now bucketed in LOCAL time (was the raw UTC date); v6
-    # added per-message cost [9]; v5 carried tool_use names [5], weekday×hour [6],
-    # model [7], stop_reason [8].
-    cache_path = cache_dir / f"claude-daily7-{dirs_hash}.json"
+    # v8: invalidate cached per-message costs for Claude Sonnet 5 pricing.
+    # v7 bucketed day_str [0] in LOCAL time; v6 added per-message cost [9]; v5
+    # carried tool_use names [5], weekday×hour [6], model [7], stop_reason [8].
+    cache_path = cache_dir / f"claude-daily8-{dirs_hash}.json"
     cache = _load_cache(cache_path)
     cache_dirty = False
 
