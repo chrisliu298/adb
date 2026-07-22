@@ -44,14 +44,19 @@ def _local_codex_session_dirs() -> list[Path]:
 
 
 def _load_remote_hosts() -> list[str]:
-    """Load remote hostnames from remotes.conf."""
+    """Load remote bucket names from remotes.conf.
+
+    Lines are ``bucket[:ssh-alias]``; only the bucket names the data/ dir and
+    MACHINES row, so the optional route override is stripped here (sync.sh owns
+    the SSH target).
+    """
     if not REMOTES_CONF.exists():
         return []
     hosts = []
     for line in REMOTES_CONF.read_text().splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
-            hosts.append(line)
+            hosts.append(line.split(":", 1)[0])
     return hosts
 
 

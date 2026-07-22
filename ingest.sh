@@ -16,7 +16,8 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 DATA="$REPO/data"
 CACHE="$REPO/.cache/remotes"
 RECOVERY="$HOME/.claude-session-recovery-20260606"   # frozen TM recovery (extra source)
-HOSTS="$(grep -vE '^[[:space:]]*(#|$)' "$REPO/remotes.conf" 2>/dev/null | tr '\n' ' ')"
+# Bucket names only — strip any `:ssh-alias` route override (see remotes.conf).
+HOSTS="$(grep -vE '^[[:space:]]*(#|$)' "$REPO/remotes.conf" 2>/dev/null | cut -d: -f1 | tr '\n' ' ')"
 [ -z "${HOSTS// /}" ] && HOSTS="l40s macmini"
 
 # Append-only JSONL trees (Claude/Codex): --append-verify never shortens a file.

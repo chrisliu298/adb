@@ -21,9 +21,9 @@ fi
 RSH='ssh -o ConnectTimeout=5 -o BatchMode=yes'
 
 sync_host() {
-    local host="$1"
-    local dest="$CACHE_DIR/$host"
-    echo "Syncing $host..."
+    local bucket="$1" host="$2"
+    local dest="$CACHE_DIR/$bucket"
+    echo "Syncing $bucket (via $host)..."
     mkdir -p "$dest/claude" "$dest/codex/sessions" "$dest/codex/archived_sessions" "$dest/grok"
 
     rsync -az --timeout=10 -e "$RSH" \
@@ -98,13 +98,19 @@ sync_host() {
         "$host:/mnt/data1/chrisliu/code/task-synth/" \
         "$dest/codex/sessions/task-synth/" 2>/dev/null || true
 
-    echo "  $host done."
+    echo "  $bucket done."
 }
 
 pids=()
-while IFS= read -r host || [[ -n "$host" ]]; do
-    [[ -z "$host" || "$host" == \#* ]] && continue
-    sync_host "$host" &
+while IFS= read -r line || [[ -n "$line" ]]; do
+    # Trim whitespace/CR, skip blanks and comments.
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    # Format: bucket[:ssh-alias]. bucket names the .cache dest (stable); the
+    # ssh-alias is the actual connect target (default: bucket).
+    bucket="${line%%:*}"
+    host="${line#*:}"; [[ "$host" == "$line" ]] && host="$bucket"
+    sync_host "$bucket" "$host" &
     pids+=($!)
 done < "$CONF"
 
